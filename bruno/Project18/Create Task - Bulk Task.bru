@@ -1,0 +1,39 @@
+meta {
+  name: Create Task - Bulk Task
+  type: http
+  seq: 4
+}
+
+post {
+  url: http://localhost:8080/api/v1/tasks/bulk
+  body: json
+  auth: inherit
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "tasks": [
+      {
+        "taskType": "REPORT_GENERATION",
+        "payload": "{\"reportId\":\"RPT-8893\"}",
+        "priority": 10,
+        "maxAttempts": 5
+      },
+      {
+        "taskType": "REPORT_GENERATION",
+        "payload": "{\"reportId\":\"RPT-8894\"}",
+        "priority": 10,
+        "maxAttempts": 5
+      }
+    ]
+  }
+}
+
+settings {
+  encodeUrl: true
+  timeout: 0
+}

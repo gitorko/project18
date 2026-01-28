@@ -1,0 +1,97 @@
+spring:
+  application:
+    name: task-processor
+  
+  datasource:
+    url: jdbc:postgresql://localhost:5432/test-db
+    username: test
+    password: password
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
+      connection-timeout: 30000
+      idle-timeout: 600000
+      max-lifetime: 1800000
+  
+  jpa:
+    hibernate:
+      ddl-auto: update
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        format_sql: true
+    show-sql: false
+    open-in-view: false
+
+# Task Processor Configuration
+task-processor:
+  # Unique worker ID - auto-generated if not set
+  # Set this explicitly in multi-pod deployments via environment variable
+  # worker-id: ${HOSTNAME:${random.uuid}}
+  
+  poller:
+    # Enable/disable the poller
+    enabled: true
+    
+    # Number of threads in the processing pool
+    # Increase this for higher throughput
+    pool-size: 5
+    
+    # Maximum threads the pool can grow to
+    max-pool-size: 20
+    
+    # Number of tasks to fetch per poll
+    # Higher values reduce DB calls but increase memory usage
+    batch-size: 10
+    
+    # Base interval between polls (milliseconds)
+    poll-interval-ms: 1000
+    
+    # Minimum poll interval (for adaptive polling)
+    min-poll-interval-ms: 100
+    
+    # Maximum poll interval when queue is empty
+    max-poll-interval-ms: 5000
+    
+    # Use adaptive polling (longer intervals when queue is empty)
+    adaptive-polling: true
+  
+  heartbeat:
+    # How often to send heartbeats (milliseconds)
+    interval-ms: 5000
+    
+    # Time after which a task is considered stale (milliseconds)
+    # Should be > heartbeat interval * 3 to allow for missed heartbeats
+    stale-threshold-ms: 30000
+    
+    # How often to check for stale tasks (milliseconds)
+    recovery-interval-ms: 10000
+
+# Spring Actuator Configuration
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    export:
+      prometheus:
+        enabled: true
+
+# Server Configuration
+server:
+  port: 8080
+  shutdown: graceful
+
+# Logging Configuration
+logging:
+  level:
+    root: INFO
+    com.taskprocessor: DEBUG
+    org.hibernate.SQL: WARN
+    org.hibernate.type.descriptor.sql: WARN
