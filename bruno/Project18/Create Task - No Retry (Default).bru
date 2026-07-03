@@ -1,7 +1,7 @@
 meta {
-  name: Create Task
+  name: Create Task - No Retry (Default)
   type: http
-  seq: 3
+  seq: 16
 }
 
 post {
@@ -17,10 +17,8 @@ headers {
 body:json {
   {
     "taskType": "REPORT_GENERATION",
-    "payload": "{\"reportId\":\"RPT-8891\"}",
-    "priority": 10,
-    "maxAttempts": 5,
-    "timeoutSeconds": 120
+    "payload": "{\"reportId\":\"RPT-8895\"}",
+    "priority": 0
   }
 }
 

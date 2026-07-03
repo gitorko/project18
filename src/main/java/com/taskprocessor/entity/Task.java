@@ -117,6 +117,13 @@ public class Task {
     @Column(name = "scheduled_at")
     private Instant scheduledAt;
 
+    /**
+     * Max execution time in seconds before the task is cancelled and failed.
+     * Falls back to the configured default when not set.
+     */
+    @Column(name = "timeout_seconds")
+    private Integer timeoutSeconds;
+
     @PrePersist
     protected void onCreate() {
         createdAt = Instant.now();

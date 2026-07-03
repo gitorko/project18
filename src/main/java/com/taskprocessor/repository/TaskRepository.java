@@ -18,21 +18,25 @@ import java.util.UUID;
 public interface TaskRepository extends JpaRepository<Task, UUID> {
 
     /**
-     * Fetch tasks for processing using SKIP LOCKED to prevent multiple workers
+     * Fetch candidate tasks for processing using SKIP LOCKED to prevent multiple workers
      * from picking the same task. This is the key to distributed queue behavior.
-     * 
+     *
      * SKIP LOCKED skips rows that are already locked by other transactions,
      * ensuring no two workers process the same task.
+     *
+     * The result is an over-fetched candidate pool (larger than the actual batch size)
+     * so that TaskQueueService can apply fair round-robin selection by task type within
+     * each priority tier, rather than the raw FIFO order returned here.
      */
     @Query(value = """
-        SELECT * FROM tasks 
-        WHERE status = 'PENDING' 
+        SELECT * FROM tasks
+        WHERE status = 'PENDING'
         AND scheduled_at <= :now
-        ORDER BY priority DESC, created_at ASC 
-        LIMIT :batchSize 
+        ORDER BY priority DESC, created_at ASC
+        LIMIT :candidatePoolSize
         FOR UPDATE SKIP LOCKED
         """, nativeQuery = true)
-    List<Task> findTasksForProcessing(@Param("now") Instant now, @Param("batchSize") int batchSize);
+    List<Task> findTasksForProcessing(@Param("now") Instant now, @Param("candidatePoolSize") int candidatePoolSize);
 
     /**
      * Find stale tasks that have been processing for too long without heartbeat.

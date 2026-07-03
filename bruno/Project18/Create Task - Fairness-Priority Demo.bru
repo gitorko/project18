@@ -1,0 +1,47 @@
+meta {
+  name: Create Task - Fairness-Priority Demo
+  type: http
+  seq: 17
+}
+
+post {
+  url: http://localhost:8080/api/v1/tasks/bulk
+  body: json
+  auth: inherit
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "tasks": [
+      {"taskType": "TASK_A", "payload": "{\"i\":1}", "priority": 1},
+      {"taskType": "TASK_A", "payload": "{\"i\":2}", "priority": 1},
+      {"taskType": "TASK_A", "payload": "{\"i\":3}", "priority": 1},
+      {"taskType": "TASK_A", "payload": "{\"i\":4}", "priority": 1},
+      {"taskType": "TASK_A", "payload": "{\"i\":5}", "priority": 1},
+      {"taskType": "TASK_A", "payload": "{\"i\":6}", "priority": 1},
+      {"taskType": "TASK_A", "payload": "{\"i\":7}", "priority": 1},
+      {"taskType": "TASK_A", "payload": "{\"i\":8}", "priority": 1},
+      {"taskType": "TASK_A", "payload": "{\"i\":9}", "priority": 1},
+      {"taskType": "TASK_A", "payload": "{\"i\":10}", "priority": 1},
+      {"taskType": "TASK_B", "payload": "{\"i\":1}", "priority": 10},
+      {"taskType": "TASK_B", "payload": "{\"i\":2}", "priority": 10},
+      {"taskType": "TASK_B", "payload": "{\"i\":3}", "priority": 10},
+      {"taskType": "TASK_B", "payload": "{\"i\":4}", "priority": 10},
+      {"taskType": "TASK_B", "payload": "{\"i\":5}", "priority": 10},
+      {"taskType": "TASK_B", "payload": "{\"i\":6}", "priority": 10},
+      {"taskType": "TASK_B", "payload": "{\"i\":7}", "priority": 10},
+      {"taskType": "TASK_B", "payload": "{\"i\":8}", "priority": 10},
+      {"taskType": "TASK_B", "payload": "{\"i\":9}", "priority": 10},
+      {"taskType": "TASK_B", "payload": "{\"i\":10}", "priority": 10}
+    ]
+  }
+}
+
+settings {
+  encodeUrl: true
+  timeout: 0
+}

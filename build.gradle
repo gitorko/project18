@@ -30,6 +30,9 @@ dependencies {
     
     // PostgreSQL
     runtimeOnly 'org.postgresql:postgresql'
+
+    // Liquibase for schema migrations
+    implementation 'org.liquibase:liquibase-core'
     
     // Micrometer for metrics
     implementation 'io.micrometer:micrometer-registry-prometheus'

@@ -1,0 +1,20 @@
+meta {
+  name: Get Processing Tasks
+  type: http
+  seq: 19
+}
+
+get {
+  url: http://localhost:8080/api/v1/tasks/processing
+  body: json
+  auth: inherit
+}
+
+headers {
+  Content-Type: application/json
+}
+
+settings {
+  encodeUrl: true
+  timeout: 0
+}

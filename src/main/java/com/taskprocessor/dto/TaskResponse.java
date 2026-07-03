@@ -30,6 +30,7 @@ public class TaskResponse {
     private Instant completedAt;
     private Instant scheduledAt;
     private String errorMessage;
+    private Integer timeoutSeconds;
 
     public static TaskResponse fromEntity(Task task) {
         return TaskResponse.builder()
@@ -47,6 +48,7 @@ public class TaskResponse {
                 .completedAt(task.getCompletedAt())
                 .scheduledAt(task.getScheduledAt())
                 .errorMessage(task.getErrorMessage())
+                .timeoutSeconds(task.getTimeoutSeconds())
                 .build();
     }
 }

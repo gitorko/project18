@@ -26,14 +26,24 @@ public class CreateTaskRequest {
     @Builder.Default
     private Integer priority = 0;
 
+    /**
+     * Maximum retry attempts. If not specified, the task is not retried on
+     * failure (fails immediately) - retries must be explicitly opted into.
+     */
     @Min(value = 1, message = "Max attempts must be at least 1")
     @Max(value = 10, message = "Max attempts must be at most 10")
-    @Builder.Default
-    private Integer maxAttempts = 3;
+    private Integer maxAttempts;
 
     /**
      * Optional scheduled time for delayed execution.
      * If null, task will be processed immediately.
      */
     private Instant scheduledAt;
+
+    /**
+     * Max execution time in seconds before the task is cancelled and failed.
+     * If null, falls back to the configured default (task-processor.poller.default-task-timeout-seconds).
+     */
+    @Min(value = 1, message = "Timeout must be at least 1 second")
+    private Integer timeoutSeconds;
 }

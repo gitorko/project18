@@ -40,9 +40,16 @@ public class TaskPollerService {
     
     private ScheduledExecutorService pollerScheduler;
     private ScheduledExecutorService heartbeatScheduler;
-    
-    // Track tasks being processed by this worker for heartbeat updates
-    private final ConcurrentHashMap<String, Task> processingTasks = new ConcurrentHashMap<>();
+
+    // Track tasks being processed by this worker for heartbeat updates and timeout enforcement
+    private final ConcurrentHashMap<String, ProcessingHandle> processingTasks = new ConcurrentHashMap<>();
+
+    /**
+     * Bundles a task with the Future controlling its execution, so the timeout
+     * watchdog can cancel (best-effort interrupt) a task that overran its deadline.
+     */
+    private record ProcessingHandle(Task task, Future<?> future) {
+    }
 
     @PostConstruct
     public void init() {
@@ -194,21 +201,23 @@ public class TaskPollerService {
                 currentPollInterval.set(properties.getPoller().getMinPollIntervalMs());
             }
 
-            // Submit tasks for processing
+            // Submit tasks for processing. We use a plain Future (not
+            // CompletableFuture.runAsync) so the timeout watchdog can cancel/interrupt
+            // a task that overruns its deadline.
             for (Task task : tasks) {
-                processingTasks.put(task.getId().toString(), task);
-                
-                CompletableFuture.runAsync(() -> {
+                String taskKey = task.getId().toString();
+
+                Future<?> future = taskProcessorExecutor.submit(() -> {
                     try {
                         taskProcessorService.processTask(task);
+                    } catch (Exception ex) {
+                        log.error("Unexpected error processing task {}: {}", task.getId(), ex.getMessage());
                     } finally {
-                        processingTasks.remove(task.getId().toString());
+                        processingTasks.remove(taskKey);
                     }
-                }, taskProcessorExecutor).exceptionally(ex -> {
-                    log.error("Unexpected error processing task {}: {}", task.getId(), ex.getMessage());
-                    processingTasks.remove(task.getId().toString());
-                    return null;
                 });
+
+                processingTasks.put(taskKey, new ProcessingHandle(task, future));
             }
 
             taskMetrics.recordTasksPolled(tasks.size());
@@ -220,7 +229,8 @@ public class TaskPollerService {
     }
 
     /**
-     * Send heartbeats for all tasks being processed by this worker
+     * Send heartbeats for all tasks being processed by this worker, and check for
+     * tasks that have overrun their execution timeout.
      */
     private void sendHeartbeats() {
         if (!running.get()) {
@@ -228,16 +238,45 @@ public class TaskPollerService {
         }
 
         try {
-            for (Map.Entry<String, Task> entry : processingTasks.entrySet()) {
-                taskQueueService.updateHeartbeat(entry.getValue().getId());
+            for (Map.Entry<String, ProcessingHandle> entry : processingTasks.entrySet()) {
+                Task task = entry.getValue().task();
+
+                if (hasTimedOut(task)) {
+                    // Atomically claim this task so a concurrent normal completion
+                    // doesn't also try to handle it (see TaskQueueService's
+                    // PROCESSING-status guard for the corresponding DB-side safeguard).
+                    ProcessingHandle claimed = processingTasks.remove(entry.getKey());
+                    if (claimed != null) {
+                        int timeoutSeconds = effectiveTimeoutSeconds(task);
+                        log.warn("Task {} exceeded timeout of {}s, cancelling", task.getId(), timeoutSeconds);
+                        claimed.future().cancel(true);
+                        taskQueueService.failTask(task.getId(),
+                                "Task exceeded timeout of " + timeoutSeconds + "s");
+                    }
+                    continue;
+                }
+
+                taskQueueService.updateHeartbeat(task.getId());
             }
-            
+
             if (!processingTasks.isEmpty()) {
                 log.debug("Sent heartbeats for {} tasks", processingTasks.size());
             }
         } catch (Exception e) {
             log.error("Error sending heartbeats: {}", e.getMessage(), e);
         }
+    }
+
+    private boolean hasTimedOut(Task task) {
+        long elapsedMs = System.currentTimeMillis() - task.getStartedAt().toEpochMilli();
+        long timeoutMs = effectiveTimeoutSeconds(task) * 1000L;
+        return elapsedMs > timeoutMs;
+    }
+
+    private int effectiveTimeoutSeconds(Task task) {
+        return task.getTimeoutSeconds() != null
+                ? task.getTimeoutSeconds()
+                : properties.getPoller().getDefaultTaskTimeoutSeconds();
     }
 
     /**

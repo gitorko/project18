@@ -72,6 +72,24 @@ public class TaskProcessorProperties {
          * Whether to use adaptive polling (longer intervals when queue is empty)
          */
         private boolean adaptivePolling = true;
+
+        /**
+         * How many times batchSize to over-fetch as a candidate pool for fair
+         * round-robin selection by task type within a priority tier.
+         */
+        private int fairnessCandidateMultiplier = 5;
+
+        /**
+         * Absolute cap on the candidate pool size, regardless of batchSize/multiplier,
+         * to bound query and lock-holding cost.
+         */
+        private int maxFairnessCandidates = 200;
+
+        /**
+         * Default max execution time for a task before it's cancelled and failed,
+         * used when a task doesn't specify its own timeoutSeconds.
+         */
+        private int defaultTaskTimeoutSeconds = 120;
     }
 
     @Data

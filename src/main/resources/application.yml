@@ -15,13 +15,18 @@ spring:
   
   jpa:
     hibernate:
-      ddl-auto: update
+      # Schema is now owned by Liquibase (see spring.liquibase below); Hibernate only
+      # validates that entity mappings match what Liquibase created.
+      ddl-auto: validate
     properties:
       hibernate:
         dialect: org.hibernate.dialect.PostgreSQLDialect
         format_sql: true
     show-sql: false
     open-in-view: false
+
+  liquibase:
+    change-log: classpath:db/changelog/db.changelog-master.xml
 
 # Task Processor Configuration
 task-processor:

@@ -1,7 +1,7 @@
 meta {
-  name: Create Task
+  name: Create Task - Timeout Demo
   type: http
-  seq: 3
+  seq: 18
 }
 
 post {
@@ -16,11 +16,10 @@ headers {
 
 body:json {
   {
-    "taskType": "REPORT_GENERATION",
-    "payload": "{\"reportId\":\"RPT-8891\"}",
-    "priority": 10,
-    "maxAttempts": 5,
-    "timeoutSeconds": 120
+    "taskType": "sample",
+    "payload": "{\"processingTimeMs\": 30000}",
+    "priority": 0,
+    "timeoutSeconds": 5
   }
 }
 

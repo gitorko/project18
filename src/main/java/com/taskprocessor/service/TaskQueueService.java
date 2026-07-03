@@ -41,8 +41,13 @@ public class TaskQueueService {
                 .taskType(request.getTaskType())
                 .payload(request.getPayload())
                 .priority(request.getPriority() != null ? request.getPriority() : 0)
-                .maxAttempts(request.getMaxAttempts() != null ? request.getMaxAttempts() : 3)
-                .status(request.getScheduledAt() != null && request.getScheduledAt().isAfter(Instant.now()) 
+                // Retries must be explicitly opted into at creation time; otherwise
+                // a failure (including a timeout) fails the task immediately.
+                .maxAttempts(request.getMaxAttempts() != null ? request.getMaxAttempts() : 1)
+                .timeoutSeconds(request.getTimeoutSeconds() != null
+                        ? request.getTimeoutSeconds()
+                        : properties.getPoller().getDefaultTaskTimeoutSeconds())
+                .status(request.getScheduledAt() != null && request.getScheduledAt().isAfter(Instant.now())
                         ? TaskStatus.SCHEDULED : TaskStatus.PENDING)
                 .scheduledAt(request.getScheduledAt())
                 .build();
@@ -64,7 +69,10 @@ public class TaskQueueService {
                         .taskType(req.getTaskType())
                         .payload(req.getPayload())
                         .priority(req.getPriority() != null ? req.getPriority() : 0)
-                        .maxAttempts(req.getMaxAttempts() != null ? req.getMaxAttempts() : 3)
+                        .maxAttempts(req.getMaxAttempts() != null ? req.getMaxAttempts() : 1)
+                        .timeoutSeconds(req.getTimeoutSeconds() != null
+                                ? req.getTimeoutSeconds()
+                                : properties.getPoller().getDefaultTaskTimeoutSeconds())
                         .status(req.getScheduledAt() != null && req.getScheduledAt().isAfter(Instant.now())
                                 ? TaskStatus.SCHEDULED : TaskStatus.PENDING)
                         .scheduledAt(req.getScheduledAt())
@@ -84,30 +92,86 @@ public class TaskQueueService {
     /**
      * Dequeue tasks for processing using SKIP LOCKED.
      * This is the core of the distributed queue - ensures no two workers get the same task.
+     *
+     * Priority still strictly wins across tiers (a lower-priority task type is never
+     * picked while any higher-priority task is pending), but within a single priority
+     * tier, task types are selected round-robin instead of pure FIFO - so one heavily
+     * enqueued type can't monopolize every poll cycle at the expense of another type
+     * queued at the same priority.
      */
     @Transactional
     public List<Task> dequeueTasks(int batchSize) {
-        List<Task> tasks = taskRepository.findTasksForProcessing(Instant.now(), batchSize);
-        
-        if (tasks.isEmpty()) {
+        int candidatePoolSize = Math.min(
+                batchSize * properties.getPoller().getFairnessCandidateMultiplier(),
+                properties.getPoller().getMaxFairnessCandidates());
+
+        List<Task> candidates = taskRepository.findTasksForProcessing(Instant.now(), candidatePoolSize);
+
+        if (candidates.isEmpty()) {
             return Collections.emptyList();
         }
 
+        List<Task> selected = selectFairBatch(candidates, batchSize);
+
         Instant now = Instant.now();
         String workerId = properties.getWorkerId();
-        
-        for (Task task : tasks) {
+
+        for (Task task : selected) {
             task.setStatus(TaskStatus.PROCESSING);
             task.setWorkerId(workerId);
             task.setStartedAt(now);
             task.setLastHeartbeat(now);
             task.setAttemptCount(task.getAttemptCount() + 1);
         }
-        
-        tasks = taskRepository.saveAll(tasks);
-        
-        log.debug("Dequeued {} tasks for processing by worker {}", tasks.size(), workerId);
-        return tasks;
+
+        selected = taskRepository.saveAll(selected);
+
+        log.debug("Dequeued {} tasks for processing by worker {} (from {} candidates)",
+                selected.size(), workerId, candidates.size());
+        return selected;
+    }
+
+    /**
+     * Select up to batchSize tasks from the candidate pool, round-robin by task type
+     * within each priority tier. The candidate list is already ordered by
+     * priority DESC, created_at ASC, so grouping in encounter order naturally yields
+     * priority tiers from highest to lowest, and per-type FIFO order within each tier.
+     */
+    private List<Task> selectFairBatch(List<Task> candidates, int batchSize) {
+        LinkedHashMap<Integer, LinkedHashMap<String, ArrayDeque<Task>>> byPriority = new LinkedHashMap<>();
+        for (Task task : candidates) {
+            byPriority
+                    .computeIfAbsent(task.getPriority(), p -> new LinkedHashMap<>())
+                    .computeIfAbsent(task.getTaskType(), t -> new ArrayDeque<>())
+                    .addLast(task);
+        }
+
+        List<Task> result = new ArrayList<>(Math.min(batchSize, candidates.size()));
+
+        for (LinkedHashMap<String, ArrayDeque<Task>> byType : byPriority.values()) {
+            if (result.size() >= batchSize) {
+                break;
+            }
+            // Round-robin across task types within this priority tier until the tier
+            // is drained or the batch is full - only then does the next (lower)
+            // priority tier get considered.
+            boolean progressed = true;
+            while (result.size() < batchSize && progressed) {
+                progressed = false;
+                for (ArrayDeque<Task> queue : byType.values()) {
+                    if (result.size() >= batchSize) {
+                        break;
+                    }
+                    Task next = queue.pollFirst();
+                    if (next != null) {
+                        result.add(next);
+                        progressed = true;
+                    }
+                }
+            }
+        }
+
+        return result;
     }
 
     /**
@@ -116,6 +180,12 @@ public class TaskQueueService {
     @Transactional
     public void completeTask(UUID taskId) {
         taskRepository.findById(taskId).ifPresent(task -> {
+            // Guards against a late write racing with the timeout watchdog (which may
+            // have already moved this task to PENDING/FAILED and possibly had it
+            // re-dequeued by another worker) or a stale duplicate completion signal.
+            if (task.getStatus() != TaskStatus.PROCESSING) {
+                return;
+            }
             task.setStatus(TaskStatus.COMPLETED);
             task.setCompletedAt(Instant.now());
             task.setWorkerId(null);
@@ -134,6 +204,9 @@ public class TaskQueueService {
     @Transactional
     public void failTask(UUID taskId, String errorMessage) {
         taskRepository.findById(taskId).ifPresent(task -> {
+            if (task.getStatus() != TaskStatus.PROCESSING) {
+                return;
+            }
             if (task.getAttemptCount() < task.getMaxAttempts()) {
                 // Schedule for retry
                 task.setStatus(TaskStatus.PENDING);

@@ -1,0 +1,20 @@
+meta {
+  name: Start Poller
+  type: http
+  seq: 20
+}
+
+post {
+  url: http://localhost:8080/api/v1/poller/start
+  body: json
+  auth: inherit
+}
+
+headers {
+  Content-Type: application/json
+}
+
+settings {
+  encodeUrl: true
+  timeout: 0
+}
