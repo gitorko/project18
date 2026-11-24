@@ -83,8 +83,9 @@ external side effects.
 | `DELETE /api/v1/tasks/{taskId}` | Cancel a `PENDING` or `SCHEDULED` task. It does not interrupt a running handler. |
 
 Validation bounds are defined by the request DTOs: task type is required;
-priority is from -100 to 100; `maxAttempts` is from 1 to 10 when supplied;
-timeout is at least one second; and a bulk request has at most 1,000 tasks.
+priority must be `LOW`, `MEDIUM`, or `HIGH` (default `MEDIUM`);
+`maxAttempts` is from 1 to 10 when supplied; timeout is at least one second;
+and a bulk request has at most 1,000 tasks.
 Validation errors and illegal arguments return `400`; unexpected errors return
 a generic `500` response.
 
@@ -108,8 +109,11 @@ UUID, type, text payload, priority, attempt limits, timeout, status, worker ID,
 timestamps, and the most recent error message. The schema has indexes for queue
 selection, status, worker ID, and heartbeat lookups.
 
-An omitted priority is zero. An omitted `maxAttempts` is **one**, meaning no
-retry after the first failure. Set `maxAttempts` greater than one to opt into
+An omitted priority is `MEDIUM`. The API uses named priority values, while the
+database stores an integer rank so SQL can efficiently sort tasks. A migration
+maps existing negative priorities to `LOW`, zero to `MEDIUM`, and positive
+priorities to `HIGH`. An omitted `maxAttempts` is **one**, meaning no retry
+after the first failure. Set `maxAttempts` greater than one to opt into
 immediate retries. An omitted timeout uses
 `task-processor.poller.default-task-timeout-seconds` (120 seconds by default).
 

@@ -3,6 +3,7 @@ package com.taskprocessor.service;
 import com.taskprocessor.config.TaskProcessorProperties;
 import com.taskprocessor.dto.*;
 import com.taskprocessor.entity.Task;
+import com.taskprocessor.entity.TaskPriority;
 import com.taskprocessor.entity.TaskStatus;
 import com.taskprocessor.metrics.TaskMetrics;
 import com.taskprocessor.repository.TaskRepository;
@@ -40,7 +41,7 @@ public class TaskQueueService {
         Task task = Task.builder()
                 .taskType(request.getTaskType())
                 .payload(request.getPayload())
-                .priority(request.getPriority() != null ? request.getPriority() : 0)
+                .priority(request.getPriority() != null ? request.getPriority() : TaskPriority.MEDIUM)
                 // Retries must be explicitly opted into at creation time; otherwise
                 // a failure (including a timeout) fails the task immediately.
                 .maxAttempts(request.getMaxAttempts() != null ? request.getMaxAttempts() : 1)
@@ -68,7 +69,7 @@ public class TaskQueueService {
                 .map(req -> Task.builder()
                         .taskType(req.getTaskType())
                         .payload(req.getPayload())
-                        .priority(req.getPriority() != null ? req.getPriority() : 0)
+                        .priority(req.getPriority() != null ? req.getPriority() : TaskPriority.MEDIUM)
                         .maxAttempts(req.getMaxAttempts() != null ? req.getMaxAttempts() : 1)
                         .timeoutSeconds(req.getTimeoutSeconds() != null
                                 ? req.getTimeoutSeconds()
@@ -138,7 +139,7 @@ public class TaskQueueService {
      * priority tiers from highest to lowest, and per-type FIFO order within each tier.
      */
     private List<Task> selectFairBatch(List<Task> candidates, int batchSize) {
-        LinkedHashMap<Integer, LinkedHashMap<String, ArrayDeque<Task>>> byPriority = new LinkedHashMap<>();
+        LinkedHashMap<TaskPriority, LinkedHashMap<String, ArrayDeque<Task>>> byPriority = new LinkedHashMap<>();
         for (Task task : candidates) {
             byPriority
                     .computeIfAbsent(task.getPriority(), p -> new LinkedHashMap<>())

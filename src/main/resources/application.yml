@@ -1,6 +1,10 @@
 spring:
   application:
     name: task-processor
+
+  jackson:
+    deserialization:
+      fail-on-numbers-for-enums: true
   
   datasource:
     url: jdbc:postgresql://localhost:5432/test-db

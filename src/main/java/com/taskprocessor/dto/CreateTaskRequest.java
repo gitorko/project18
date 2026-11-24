@@ -1,5 +1,6 @@
 package com.taskprocessor.dto;
 
+import com.taskprocessor.entity.TaskPriority;
 import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
@@ -7,7 +8,6 @@ import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
-
 import java.time.Instant;
 
 @Data
@@ -21,10 +21,8 @@ public class CreateTaskRequest {
 
     private String payload;
 
-    @Min(value = -100, message = "Priority must be at least -100")
-    @Max(value = 100, message = "Priority must be at most 100")
     @Builder.Default
-    private Integer priority = 0;
+    private TaskPriority priority = TaskPriority.MEDIUM;
 
     /**
      * Maximum retry attempts. If not specified, the task is not retried on

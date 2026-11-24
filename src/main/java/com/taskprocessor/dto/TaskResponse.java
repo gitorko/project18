@@ -1,6 +1,7 @@
 package com.taskprocessor.dto;
 
 import com.taskprocessor.entity.Task;
+import com.taskprocessor.entity.TaskPriority;
 import com.taskprocessor.entity.TaskStatus;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
@@ -20,7 +21,7 @@ public class TaskResponse {
     private String taskType;
     private String payload;
     private TaskStatus status;
-    private Integer priority;
+    private TaskPriority priority;
     private Integer attemptCount;
     private Integer maxAttempts;
     private String workerId;

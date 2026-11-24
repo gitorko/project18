@@ -7,5 +7,6 @@
 
     <include file="db/changelog/changes/001-create-tasks-table.sql" relativeToChangelogFile="false"/>
     <include file="db/changelog/changes/002-add-timeout-seconds.sql" relativeToChangelogFile="false"/>
+    <include file="db/changelog/changes/003-map-numeric-priorities.sql" relativeToChangelogFile="false"/>
 
 </databaseChangeLog>

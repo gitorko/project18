@@ -4,6 +4,7 @@ import com.taskprocessor.config.TaskProcessorProperties;
 import com.taskprocessor.dto.CreateTaskRequest;
 import com.taskprocessor.dto.TaskResponse;
 import com.taskprocessor.entity.Task;
+import com.taskprocessor.entity.TaskPriority;
 import com.taskprocessor.entity.TaskStatus;
 import com.taskprocessor.metrics.TaskMetrics;
 import com.taskprocessor.repository.TaskRepository;
@@ -46,7 +47,7 @@ class TaskQueueServiceTest {
         TaskResponse result = service.enqueueTask(CreateTaskRequest.builder().taskType("mail").build());
         ArgumentCaptor<Task> captor = ArgumentCaptor.forClass(Task.class);
         verify(repository).save(captor.capture());
-        assertEquals(0, captor.getValue().getPriority());
+        assertEquals(TaskPriority.MEDIUM, captor.getValue().getPriority());
         assertEquals(1, captor.getValue().getMaxAttempts());
         assertEquals(properties.getPoller().getDefaultTaskTimeoutSeconds(), captor.getValue().getTimeoutSeconds());
         assertEquals(TaskStatus.PENDING, captor.getValue().getStatus());
@@ -65,7 +66,8 @@ class TaskQueueServiceTest {
     }
 
     @Test void dequeueMarksSelectedRowsAndRoundRobinsWithinPriority() {
-        Task a1 = task("a", 1, 10), a2 = task("a", 1, 10), b1 = task("b", 1, 10), low = task("low", 0, 10);
+        Task a1 = task("a", TaskPriority.MEDIUM, 10), a2 = task("a", TaskPriority.MEDIUM, 10),
+                b1 = task("b", TaskPriority.MEDIUM, 10), low = task("low", TaskPriority.LOW, 10);
         when(repository.findTasksForProcessing(any(), anyInt())).thenReturn(List.of(a1, a2, b1, low));
         when(repository.saveAll(anyList())).thenAnswer(inv -> inv.getArgument(0));
         List<Task> result = service.dequeueTasks(3);
@@ -83,7 +85,7 @@ class TaskQueueServiceTest {
     }
 
     @Test void completeTaskUpdatesOnlyProcessingTasks() {
-        Task task = task("x", 0, 1);
+        Task task = task("x", TaskPriority.MEDIUM, 1);
         task.setStatus(TaskStatus.PROCESSING); task.setStartedAt(Instant.now().minusMillis(50));
         when(repository.findByIdForUpdate(task.getId())).thenReturn(Optional.of(task));
         service.completeTask(task.getId(), task.getAttemptCount());
@@ -100,7 +102,7 @@ class TaskQueueServiceTest {
     }
 
     @Test void staleAttemptCannotCompleteNewerRetry() {
-        Task currentAttempt = task("x", 0, 3);
+        Task currentAttempt = task("x", TaskPriority.MEDIUM, 3);
         currentAttempt.setStatus(TaskStatus.PROCESSING);
         currentAttempt.setAttemptCount(2);
         when(repository.findByIdForUpdate(currentAttempt.getId())).thenReturn(Optional.of(currentAttempt));
@@ -110,7 +112,7 @@ class TaskQueueServiceTest {
     }
 
     @Test void failTaskRetriesThenMarksExhaustedTaskFailed() {
-        Task task = task("x", 0, 2); task.setStatus(TaskStatus.PROCESSING); task.setAttemptCount(1);
+        Task task = task("x", TaskPriority.MEDIUM, 2); task.setStatus(TaskStatus.PROCESSING); task.setAttemptCount(1);
         when(repository.findByIdForUpdate(task.getId())).thenReturn(Optional.of(task));
         service.failTask(task.getId(), task.getAttemptCount(), "retry me");
         assertEquals(TaskStatus.PENDING, task.getStatus());
@@ -125,7 +127,7 @@ class TaskQueueServiceTest {
     }
 
     @Test void cancelOnlyPendingOrScheduledTasks() {
-        Task task = task("x", 0, 1); task.setStatus(TaskStatus.PENDING);
+        Task task = task("x", TaskPriority.MEDIUM, 1); task.setStatus(TaskStatus.PENDING);
         when(repository.findById(task.getId())).thenReturn(Optional.of(task));
         assertTrue(service.cancelTask(task.getId()));
         assertEquals(TaskStatus.CANCELLED, task.getStatus());
@@ -134,7 +136,7 @@ class TaskQueueServiceTest {
     }
 
     @Test void getTaskAndListsMapEntitiesToResponses() {
-        Task task = task("x", 0, 1);
+        Task task = task("x", TaskPriority.MEDIUM, 1);
         when(repository.findById(task.getId())).thenReturn(Optional.of(task));
         assertEquals(task.getId(), service.getTask(task.getId()).orElseThrow().getId());
         Page<Task> page = new PageImpl<>(List.of(task));
@@ -158,6 +160,7 @@ class TaskQueueServiceTest {
         when(repository.countByTaskTypeAndStatus()).thenReturn(List.<Object[]>of(
                 new Object[]{"x", TaskStatus.PENDING, 2L}, new Object[]{"x", TaskStatus.PROCESSING, 1L}));
         when(metrics.getAverageProcessingTimeMs()).thenReturn(1000.0);
+        when(metrics.getAverageProcessingTimeMs("x")).thenReturn(1000.0);
         when(metrics.getCurrentPoolSize()).thenReturn(2);
         when(metrics.getConfiguredPoolSize()).thenReturn(2);
         var summary = service.getTaskSummary();
@@ -167,7 +170,7 @@ class TaskQueueServiceTest {
         assertEquals(2L, summary.getEstimatedBacklogCompletionSeconds());
     }
 
-    private Task task(String type, int priority, int maxAttempts) {
+    private Task task(String type, TaskPriority priority, int maxAttempts) {
         return Task.builder().id(UUID.randomUUID()).taskType(type).priority(priority).maxAttempts(maxAttempts)
                 .attemptCount(0).status(TaskStatus.PENDING).build();
     }

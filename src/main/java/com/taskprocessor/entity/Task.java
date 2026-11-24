@@ -48,12 +48,11 @@ public class Task {
     @Builder.Default
     private TaskStatus status = TaskStatus.PENDING;
 
-    /**
-     * Priority for processing (higher = more urgent)
-     */
+    /** Named priority for processing (higher = more urgent). */
+    @Convert(converter = TaskPriorityConverter.class)
     @Column(name = "priority")
     @Builder.Default
-    private Integer priority = 0;
+    private TaskPriority priority = TaskPriority.MEDIUM;
 
     /**
      * Number of times this task has been attempted

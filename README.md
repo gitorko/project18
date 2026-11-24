@@ -44,6 +44,8 @@ docker-compose up -d postgres
 
 #### Create a Task
 
+Priority is a named value: `LOW`, `MEDIUM` (the default), or `HIGH`.
+
 ```bash
 POST /api/v1/tasks
 Content-Type: application/json
@@ -51,7 +53,7 @@ Content-Type: application/json
 {
   "taskType": "sample",
   "payload": "{\"key\": \"value\"}",
-  "priority": 0,
+  "priority": "HIGH",
   "maxAttempts": 3
 }
 ```
