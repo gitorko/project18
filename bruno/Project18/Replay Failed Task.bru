@@ -1,0 +1,16 @@
+meta {
+  name: Replay Failed Task
+  type: http
+  seq: 9
+}
+
+post {
+  url: http://localhost:8080/api/v1/tasks/00000000-0000-0000-0000-000000000001/replay
+  body: none
+  auth: inherit
+}
+
+settings {
+  encodeUrl: true
+  timeout: 0
+}

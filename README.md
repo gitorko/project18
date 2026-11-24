@@ -45,6 +45,24 @@ to use IPv4 for the download and build:
 JAVA_TOOL_OPTIONS="-Djava.net.preferIPv4Stack=true" ./gradlew clean build
 ```
 
+If Gradle starts but reports that a plugin or dependency cannot be resolved,
+check that your network or proxy allows Maven Central and the Gradle Plugin
+Portal. The IPv4 option does not fix a blocked repository connection. You can
+check Maven Central connectivity with:
+
+```bash
+curl -I https://repo.maven.apache.org/maven2/
+```
+
+If Gradle still reports `Broken pipe` while resolving a plugin, an already
+running Gradle daemon may not have inherited the current Java network options.
+Stop old daemons and retry with a fresh process:
+
+```bash
+./gradlew --stop
+JAVA_TOOL_OPTIONS="-Djava.net.preferIPv4Stack=true" ./gradlew clean build --no-daemon
+```
+
 ### Run locally
 
 1. Start PostgreSQL with Docker Compose:
@@ -79,6 +97,28 @@ To run that image, configure `SPRING_DATASOURCE_URL`,
 `SPRING_DATASOURCE_USERNAME`, and `SPRING_DATASOURCE_PASSWORD` to point to your
 PostgreSQL instance. When PostgreSQL runs in Docker Compose, use the Compose
 service name `postgres` as the database host for a containerized app.
+
+### Submit a sample task
+
+The application includes a `SampleTaskHandler` for the `sample` task type. Once
+the app is running, submit a task with `curl`:
+
+```bash
+curl -i -X POST http://localhost:8080/api/v1/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{"taskType":"sample","payload":"{\"processingTimeMs\":100}","priority":"MEDIUM","maxAttempts":3}'
+```
+
+The response contains the task ID. Use it to check the task's status and
+result; it will move from `PENDING` to `PROCESSING` and then `COMPLETED`:
+
+```bash
+TASK_ID='paste-task-id-from-response'
+curl "http://localhost:8080/api/v1/tasks/${TASK_ID}"
+```
+
+The built-in handler is a demonstration. In an application, register a
+`TaskHandler` for each task type and put that type's input data in `payload`.
 
 ## API Reference
 
@@ -674,19 +714,21 @@ Implement `TaskHandler` as a Spring bean. The processor routes each task by
 matching handler:
 
 ```java
+import com.taskprocessor.entity.Task;
+import com.taskprocessor.service.TaskHandler;
+import org.springframework.stereotype.Component;
+
 @Component
-public class EmailTaskHandler implements TaskHandler {
+public class PrintTaskHandler implements TaskHandler {
 
     @Override
     public String getTaskType() {
-        return "send-email";
+        return "print";
     }
 
     @Override
-    public void handle(Task task) throws Exception {
-        EmailPayload payload = objectMapper.readValue(
-                task.getPayload(), EmailPayload.class);
-        emailService.send(payload);
+    public void handle(Task task) {
+        System.out.printf("Task %s payload: %s%n", task.getId(), task.getPayload());
     }
 }
 ```
@@ -695,7 +737,7 @@ Then submit a task with that `taskType`:
 
 ```json
 {
-  "taskType": "send-email",
-  "payload": "{\"to\": \"user@example.com\", \"subject\": \"Hello\"}"
+  "taskType": "print",
+  "payload": "{\"message\": \"Hello\"}"
 }
 ```
