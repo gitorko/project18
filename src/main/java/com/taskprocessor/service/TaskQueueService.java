@@ -178,12 +178,12 @@ public class TaskQueueService {
      * Mark a task as completed
      */
     @Transactional
-    public void completeTask(UUID taskId) {
-        taskRepository.findById(taskId).ifPresent(task -> {
+    public void completeTask(UUID taskId, int attemptCount) {
+        taskRepository.findByIdForUpdate(taskId).ifPresent(task -> {
             // Guards against a late write racing with the timeout watchdog (which may
             // have already moved this task to PENDING/FAILED and possibly had it
             // re-dequeued by another worker) or a stale duplicate completion signal.
-            if (task.getStatus() != TaskStatus.PROCESSING) {
+            if (task.getStatus() != TaskStatus.PROCESSING || task.getAttemptCount() != attemptCount) {
                 return;
             }
             task.setStatus(TaskStatus.COMPLETED);
@@ -202,9 +202,9 @@ public class TaskQueueService {
      * Mark a task as failed
      */
     @Transactional
-    public void failTask(UUID taskId, String errorMessage) {
-        taskRepository.findById(taskId).ifPresent(task -> {
-            if (task.getStatus() != TaskStatus.PROCESSING) {
+    public void failTask(UUID taskId, int attemptCount, String errorMessage) {
+        taskRepository.findByIdForUpdate(taskId).ifPresent(task -> {
+            if (task.getStatus() != TaskStatus.PROCESSING || task.getAttemptCount() != attemptCount) {
                 return;
             }
             if (task.getAttemptCount() < task.getMaxAttempts()) {
@@ -277,6 +277,31 @@ public class TaskQueueService {
         taskRepository.countByTaskTypeAndStatus(TaskStatus.PENDING)
                 .forEach(row -> pendingByType.put((String) row[0], (Long) row[1]));
 
+        Map<String, TaskTypeSummary> byTaskType = new TreeMap<>();
+        taskRepository.countByTaskTypeAndStatus().forEach(row -> {
+            String type = (String) row[0];
+            TaskStatus status = (TaskStatus) row[1];
+            long count = (Long) row[2];
+            TaskTypeSummary current = byTaskType.computeIfAbsent(type, ignored -> TaskTypeSummary.builder().build());
+            switch (status) {
+                case PENDING -> current.setPendingTasks(count);
+                case SCHEDULED -> current.setScheduledTasks(count);
+                case PROCESSING -> current.setProcessingTasks(count);
+                case COMPLETED -> current.setCompletedTasks(count);
+                case FAILED -> current.setFailedTasks(count);
+                case CANCELLED -> current.setCancelledTasks(count);
+                default -> { }
+            }
+        });
+        byTaskType.forEach((type, stats) -> stats.setAvgProcessingTimeMs(taskMetrics.getAverageProcessingTimeMs(type)));
+
+        long outstandingTasks = pending + processing;
+        double averageMs = taskMetrics.getAverageProcessingTimeMs();
+        int workerCapacity = Math.max(1, taskMetrics.getConfiguredPoolSize());
+        Long estimatedBacklogCompletionSeconds = averageMs > 0
+                ? (long) Math.ceil((outstandingTasks * averageMs) / workerCapacity / 1000.0)
+                : null;
+
         return TaskSummaryResponse.builder()
                 .totalTasks(pending + processing + completed + failed + cancelled + scheduled)
                 .pendingTasks(pending)
@@ -286,10 +311,12 @@ public class TaskQueueService {
                 .cancelledTasks(cancelled)
                 .scheduledTasks(scheduled)
                 .pendingByType(pendingByType)
+                .byTaskType(byTaskType)
                 .processingRatePerMinute(taskMetrics.getProcessingRatePerMinute())
                 .avgProcessingTimeMs(taskMetrics.getAverageProcessingTimeMs())
                 .activeWorkers(taskMetrics.getActiveWorkerCount())
                 .currentPoolSize(taskMetrics.getCurrentPoolSize())
+                .estimatedBacklogCompletionSeconds(estimatedBacklogCompletionSeconds)
                 .build();
     }
 

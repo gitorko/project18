@@ -36,6 +36,9 @@ dependencies {
     
     // Micrometer for metrics
     implementation 'io.micrometer:micrometer-registry-prometheus'
+
+    // Unit testing
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
     
     // Lombok
     compileOnly 'org.projectlombok:lombok'

@@ -9,13 +9,21 @@ import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
+import jakarta.persistence.LockModeType;
+import org.springframework.data.jpa.repository.Lock;
 
 import java.time.Instant;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 
 @Repository
 public interface TaskRepository extends JpaRepository<Task, UUID> {
+
+    /** Lock a task while finalizing an attempt so a stale worker cannot overwrite a retry. */
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("SELECT t FROM Task t WHERE t.id = :taskId")
+    Optional<Task> findByIdForUpdate(@Param("taskId") UUID taskId);
 
     /**
      * Fetch candidate tasks for processing using SKIP LOCKED to prevent multiple workers
@@ -86,7 +94,6 @@ public interface TaskRepository extends JpaRepository<Task, UUID> {
         SET t.status = 'PENDING', 
             t.workerId = null, 
             t.lastHeartbeat = null,
-            t.attemptCount = t.attemptCount + 1,
             t.updatedAt = :now
         WHERE t.status = 'PROCESSING' 
         AND t.lastHeartbeat < :staleThreshold
@@ -133,4 +140,8 @@ public interface TaskRepository extends JpaRepository<Task, UUID> {
      */
     @Query("SELECT t.taskType, COUNT(t) FROM Task t WHERE t.status = :status GROUP BY t.taskType")
     List<Object[]> countByTaskTypeAndStatus(@Param("status") TaskStatus status);
+
+    /** Count tasks by type and lifecycle status for the public queue summary. */
+    @Query("SELECT t.taskType, t.status, COUNT(t) FROM Task t GROUP BY t.taskType, t.status")
+    List<Object[]> countByTaskTypeAndStatus();
 }

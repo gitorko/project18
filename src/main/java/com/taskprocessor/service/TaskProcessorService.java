@@ -62,7 +62,7 @@ public class TaskProcessorService {
             handler.handle(task);
             
             // Mark as completed
-            taskQueueService.completeTask(task.getId());
+            taskQueueService.completeTask(task.getId(), task.getAttemptCount());
             
             long duration = System.currentTimeMillis() - startTime;
             log.debug("Task {} completed in {}ms", task.getId(), duration);
@@ -71,7 +71,7 @@ public class TaskProcessorService {
             long duration = System.currentTimeMillis() - startTime;
             log.error("Task {} failed after {}ms: {}", task.getId(), duration, e.getMessage(), e);
             
-            taskQueueService.failTask(task.getId(), e.getMessage());
+            taskQueueService.failTask(task.getId(), task.getAttemptCount(), e.getMessage());
             
         } finally {
             taskMetrics.decrementActiveProcessing();

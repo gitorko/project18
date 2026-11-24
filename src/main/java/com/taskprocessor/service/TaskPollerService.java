@@ -15,6 +15,7 @@ import java.util.Map;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Background service that polls for tasks and processes them.
@@ -86,12 +87,7 @@ public class TaskPollerService {
             return t;
         });
         
-        pollerScheduler.scheduleWithFixedDelay(
-                this::pollAndProcess,
-                0,
-                currentPollInterval.get(),
-                TimeUnit.MILLISECONDS
-        );
+        pollerScheduler.execute(this::pollAndScheduleNext);
 
         // Start heartbeat scheduler
         heartbeatScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -173,8 +169,12 @@ public class TaskPollerService {
 
         try {
             // Check if we have capacity to process more tasks
-            int availableCapacity = taskProcessorExecutor.getMaximumPoolSize() - 
-                    taskProcessorExecutor.getActiveCount();
+            // The executor uses a bounded work queue, so submissions beyond the
+            // core pool size queue instead of causing it to grow toward maxPoolSize.
+            // Only claim tasks that can start without adding avoidable executor delay.
+            int availableCapacity = taskProcessorExecutor.getCorePoolSize()
+                    - taskProcessorExecutor.getActiveCount()
+                    - taskProcessorExecutor.getQueue().size();
             
             if (availableCapacity <= 0) {
                 log.debug("Thread pool at capacity, skipping poll");
@@ -206,18 +206,28 @@ public class TaskPollerService {
             // a task that overruns its deadline.
             for (Task task : tasks) {
                 String taskKey = task.getId().toString();
+                AtomicReference<ProcessingHandle> handleReference = new AtomicReference<>();
 
-                Future<?> future = taskProcessorExecutor.submit(() -> {
+                FutureTask<Void> future = new FutureTask<>(() -> {
                     try {
                         taskProcessorService.processTask(task);
                     } catch (Exception ex) {
                         log.error("Unexpected error processing task {}: {}", task.getId(), ex.getMessage());
                     } finally {
-                        processingTasks.remove(taskKey);
+                        ProcessingHandle handle = handleReference.get();
+                        if (handle != null) {
+                            processingTasks.remove(taskKey, handle);
+                        }
                     }
+                    return null;
                 });
-
-                processingTasks.put(taskKey, new ProcessingHandle(task, future));
+                // Publish tracking before execution: a short task may finish
+                // immediately, in which case its finally block must be able to
+                // remove an already-present entry.
+                ProcessingHandle handle = new ProcessingHandle(task, future);
+                handleReference.set(handle);
+                processingTasks.put(taskKey, handle);
+                taskProcessorExecutor.execute(future);
             }
 
             taskMetrics.recordTasksPolled(tasks.size());
@@ -225,6 +235,18 @@ public class TaskPollerService {
 
         } catch (Exception e) {
             log.error("Error during poll cycle: {}", e.getMessage(), e);
+        }
+    }
+
+    /** Run one poll cycle, then schedule the next one using the latest interval. */
+    private void pollAndScheduleNext() {
+        try {
+            pollAndProcess();
+        } finally {
+            ScheduledExecutorService scheduler = pollerScheduler;
+            if (running.get() && scheduler != null && !scheduler.isShutdown()) {
+                scheduler.schedule(this::pollAndScheduleNext, currentPollInterval.get(), TimeUnit.MILLISECONDS);
+            }
         }
     }
 
@@ -250,7 +272,7 @@ public class TaskPollerService {
                         int timeoutSeconds = effectiveTimeoutSeconds(task);
                         log.warn("Task {} exceeded timeout of {}s, cancelling", task.getId(), timeoutSeconds);
                         claimed.future().cancel(true);
-                        taskQueueService.failTask(task.getId(),
+                        taskQueueService.failTask(task.getId(), task.getAttemptCount(),
                                 "Task exceeded timeout of " + timeoutSeconds + "s");
                     }
                     continue;

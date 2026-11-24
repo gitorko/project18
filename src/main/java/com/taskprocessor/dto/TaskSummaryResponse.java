@@ -25,6 +25,9 @@ public class TaskSummaryResponse {
      * Distribution of pending tasks by type
      */
     private Map<String, Long> pendingByType;
+
+    /** Counts and observed runtime, grouped by task type. */
+    private Map<String, TaskTypeSummary> byTaskType;
     
     /**
      * Current processing rate (tasks per minute)
@@ -45,4 +48,7 @@ public class TaskSummaryResponse {
      * Current thread pool size
      */
     private int currentPoolSize;
+
+    /** Estimated seconds to drain pending and running work; null until runtime samples exist. */
+    private Long estimatedBacklogCompletionSeconds;
 }

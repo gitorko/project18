@@ -1,10 +1,10 @@
-FROM eclipse-temurin:17-jdk-alpine as builder
+FROM eclipse-temurin:21.0.13.1_2-jdk-alpine AS builder
 
 WORKDIR /app
 COPY . .
 RUN ./gradlew build -x test --no-daemon
 
-FROM eclipse-temurin:17-jre-alpine
+FROM eclipse-temurin:21.0.13.1_2-jre-alpine
 
 WORKDIR /app
 COPY --from=builder /app/build/libs/*.jar app.jar

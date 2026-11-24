@@ -98,10 +98,29 @@ Response:
   "failedTasks": 10,
   "processingRatePerMinute": 120.5,
   "avgProcessingTimeMs": 450.2,
+  "estimatedBacklogCompletionSeconds": 187,
   "activeWorkers": 5,
-  "currentPoolSize": 10
+  "currentPoolSize": 10,
+  "byTaskType": {
+    "sample": {
+      "pendingTasks": 490,
+      "scheduledTasks": 0,
+      "processingTasks": 10,
+      "completedTasks": 480,
+      "failedTasks": 10,
+      "cancelledTasks": 0,
+      "avgProcessingTimeMs": 450.2
+    }
+  }
 }
 ```
+
+`estimatedBacklogCompletionSeconds` is an approximate drain time calculated
+from pending plus running tasks, the average successful runtime observed by
+this process, and the current worker pool size. It is `null` until the process
+has completed tasks and collected runtime samples. Scheduled tasks are excluded
+until they become runnable; estimates do not account for future submissions,
+priority tiers, or differences in the remaining runtime of active tasks.
 
 #### Cancel a Task
 

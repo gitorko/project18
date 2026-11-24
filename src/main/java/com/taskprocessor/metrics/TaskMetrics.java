@@ -6,8 +6,12 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
 
 import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.Map;
+import java.util.concurrent.ConcurrentLinkedDeque;
 
 /**
  * Metrics for monitoring task processing.
@@ -30,6 +34,9 @@ public class TaskMetrics {
     private final AtomicInteger activeProcessingCount = new AtomicInteger(0);
     private final AtomicLong totalProcessingTimeMs = new AtomicLong(0);
     private final AtomicLong completedTaskCount = new AtomicLong(0);
+    private final Map<String, AtomicLong> completedByType = new ConcurrentHashMap<>();
+    private final Map<String, AtomicLong> processingTimeByTypeMs = new ConcurrentHashMap<>();
+    private final ConcurrentLinkedDeque<Long> completionTimesNanos = new ConcurrentLinkedDeque<>();
 
     // Timer for processing duration
     private Timer processingTimer;
@@ -106,6 +113,11 @@ public class TaskMetrics {
         tasksCompletedCounter.increment();
         totalProcessingTimeMs.addAndGet(durationMs);
         completedTaskCount.incrementAndGet();
+        completedByType.computeIfAbsent(taskType, ignored -> new AtomicLong()).incrementAndGet();
+        processingTimeByTypeMs.computeIfAbsent(taskType, ignored -> new AtomicLong()).addAndGet(durationMs);
+        long completionTime = System.nanoTime();
+        completionTimesNanos.addLast(completionTime);
+        pruneCompletionTimes(completionTime);
         
         processingTimer.record(java.time.Duration.ofMillis(durationMs));
         
@@ -156,9 +168,24 @@ public class TaskMetrics {
      * Get the processing rate per minute
      */
     public double getProcessingRatePerMinute() {
-        // Calculate based on the timer's mean rate
-        return processingTimer.count() > 0 ? 
-                processingTimer.count() / (processingTimer.totalTime(java.util.concurrent.TimeUnit.MINUTES) + 0.001) : 0;
+        long now = System.nanoTime();
+        pruneCompletionTimes(now);
+        Long first = completionTimesNanos.peekFirst();
+        if (first == null) {
+            return 0;
+        }
+        long elapsed = Math.min(TimeUnit.MINUTES.toNanos(1), now - first);
+        // Avoid a noisy instantaneous rate when the process has only just started.
+        elapsed = Math.max(TimeUnit.SECONDS.toNanos(1), elapsed);
+        return completionTimesNanos.size() * (double) TimeUnit.MINUTES.toNanos(1) / elapsed;
+    }
+
+    private void pruneCompletionTimes(long now) {
+        long windowStart = now - TimeUnit.MINUTES.toNanos(1);
+        Long oldest;
+        while ((oldest = completionTimesNanos.peekFirst()) != null && oldest < windowStart) {
+            completionTimesNanos.removeFirstOccurrence(oldest);
+        }
     }
 
     /**
@@ -170,6 +197,12 @@ public class TaskMetrics {
             return 0;
         }
         return (double) totalProcessingTimeMs.get() / count;
+    }
+
+    public double getAverageProcessingTimeMs(String taskType) {
+        AtomicLong count = completedByType.get(taskType);
+        AtomicLong time = processingTimeByTypeMs.get(taskType);
+        return count == null || time == null || count.get() == 0 ? 0 : (double) time.get() / count.get();
     }
 
     /**
@@ -184,5 +217,9 @@ public class TaskMetrics {
      */
     public int getCurrentPoolSize() {
         return taskProcessorExecutor.getPoolSize();
+    }
+
+    public int getConfiguredPoolSize() {
+        return taskProcessorExecutor.getCorePoolSize();
     }
 }
