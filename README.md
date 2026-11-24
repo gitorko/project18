@@ -38,12 +38,8 @@ unit tests:
 ./gradlew test
 ```
 
-If the Gradle wrapper download fails with a TLS `Broken pipe` error, force Java
-to use IPv4 for the download and build:
-
-```bash
-JAVA_TOOL_OPTIONS="-Djava.net.preferIPv4Stack=true" ./gradlew clean build
-```
+Gradle is configured in `gradle.properties` to prefer IPv4 for repository
+connections, which can help on networks with unusable IPv6 routes.
 
 If Gradle starts but reports that a plugin or dependency cannot be resolved,
 check that your network or proxy allows Maven Central and the Gradle Plugin
@@ -54,13 +50,12 @@ check Maven Central connectivity with:
 curl -I https://repo.maven.apache.org/maven2/
 ```
 
-If Gradle still reports `Broken pipe` while resolving a plugin, an already
-running Gradle daemon may not have inherited the current Java network options.
-Stop old daemons and retry with a fresh process:
+If Gradle still reports `Broken pipe` while resolving a plugin, stop old daemons
+and retry with a fresh process so it picks up the Gradle JVM settings:
 
 ```bash
 ./gradlew --stop
-JAVA_TOOL_OPTIONS="-Djava.net.preferIPv4Stack=true" ./gradlew clean build --no-daemon
+./gradlew clean build --no-daemon
 ```
 
 ### Run locally
