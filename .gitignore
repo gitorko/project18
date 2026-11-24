@@ -1,6 +1,9 @@
 # macOS
 .DS_Store
 
+# Local editor settings
+.vscode/
+
 HELP.md
 .gradle
 build/
