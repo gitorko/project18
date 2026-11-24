@@ -16,6 +16,7 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.Collection;
 
 @Repository
 public interface TaskRepository extends JpaRepository<Task, UUID> {
@@ -46,6 +47,23 @@ public interface TaskRepository extends JpaRepository<Task, UUID> {
         """, nativeQuery = true)
     List<Task> findTasksForProcessing(@Param("now") Instant now, @Param("candidatePoolSize") int candidatePoolSize);
 
+    /** Promote due scheduled tasks and delayed retries, distributing rows safely across workers. */
+    @Modifying
+    @Query(value = """
+        WITH due_tasks AS (
+            SELECT id FROM tasks
+            WHERE status = 'SCHEDULED' AND scheduled_at <= :now
+            ORDER BY scheduled_at ASC
+            LIMIT :limit
+            FOR UPDATE SKIP LOCKED
+        )
+        UPDATE tasks t
+        SET status = 'PENDING', updated_at = :now
+        FROM due_tasks d
+        WHERE t.id = d.id
+        """, nativeQuery = true)
+    int promoteDueScheduledTasks(@Param("now") Instant now, @Param("limit") int limit);
+
     /**
      * Find stale tasks that have been processing for too long without heartbeat.
      * These are likely from crashed workers and need to be recovered.
@@ -62,6 +80,10 @@ public interface TaskRepository extends JpaRepository<Task, UUID> {
      * Count tasks by status for summary
      */
     long countByStatus(TaskStatus status);
+
+    long countByStatusIn(Collection<TaskStatus> statuses);
+
+    long countByTaskTypeAndStatusIn(String taskType, Collection<TaskStatus> statuses);
 
     /**
      * Find tasks by status with pagination

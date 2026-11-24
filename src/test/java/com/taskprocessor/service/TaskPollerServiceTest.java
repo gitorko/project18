@@ -33,6 +33,15 @@ class TaskPollerServiceTest {
             assertEquals(250, poller.getCurrentPollInterval());
             assertEquals(3, executor.getCorePoolSize());
             assertFalse(poller.isRunning());
+
+            poller.start();
+            assertTrue(poller.isRunning());
+            poller.stop();
+            assertFalse(poller.isRunning());
+            assertFalse(executor.isShutdown(), "stopping the poller must allow it to be restarted");
+
+            poller.start();
+            assertTrue(poller.isRunning());
             poller.stop();
         } finally {
             executor.shutdownNow();

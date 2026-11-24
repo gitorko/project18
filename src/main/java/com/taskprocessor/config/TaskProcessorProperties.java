@@ -5,6 +5,8 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.stereotype.Component;
 
 import java.util.UUID;
+import java.util.HashMap;
+import java.util.Map;
 
 /**
  * Configuration properties for the task processor.
@@ -30,6 +32,25 @@ public class TaskProcessorProperties {
      * Heartbeat configuration for detecting stuck tasks
      */
     private HeartbeatConfig heartbeat = new HeartbeatConfig();
+
+    private RetryConfig retry = new RetryConfig();
+
+    private AdmissionConfig admission = new AdmissionConfig();
+
+    @Data
+    public static class RetryConfig {
+        private long initialDelayMs = 1000;
+        private long maxDelayMs = 60000;
+        private double jitterFactor = 0.2;
+    }
+
+    @Data
+    public static class AdmissionConfig {
+        /** Maximum outstanding tasks across all task types; zero disables the limit. */
+        private long maxOutstandingTasks = 10000;
+        /** Optional per-task-type outstanding limits, keyed by taskType. */
+        private Map<String, Long> maxOutstandingByType = new HashMap<>();
+    }
 
     @Data
     public static class PollerConfig {
@@ -90,6 +111,9 @@ public class TaskProcessorProperties {
          * used when a task doesn't specify its own timeoutSeconds.
          */
         private int defaultTaskTimeoutSeconds = 120;
+
+        /** Per-type maximum active tasks on this worker; absent types use the pool size. */
+        private Map<String, Integer> maxConcurrentByType = new HashMap<>();
     }
 
     @Data

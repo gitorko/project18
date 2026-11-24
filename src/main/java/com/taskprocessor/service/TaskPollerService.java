@@ -89,19 +89,7 @@ public class TaskPollerService {
         
         pollerScheduler.execute(this::pollAndScheduleNext);
 
-        // Start heartbeat scheduler
-        heartbeatScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "task-heartbeat");
-            t.setDaemon(true);
-            return t;
-        });
-        
-        heartbeatScheduler.scheduleAtFixedRate(
-                this::sendHeartbeats,
-                properties.getHeartbeat().getIntervalMs(),
-                properties.getHeartbeat().getIntervalMs(),
-                TimeUnit.MILLISECONDS
-        );
+        startHeartbeatSchedulerIfNeeded();
 
         log.info("Task poller started");
     }
@@ -109,7 +97,6 @@ public class TaskPollerService {
     /**
      * Stop the poller gracefully
      */
-    @PreDestroy
     public synchronized void stop() {
         if (!running.get()) {
             return;
@@ -131,32 +118,82 @@ public class TaskPollerService {
             }
         }
 
-        // Stop heartbeats
-        if (heartbeatScheduler != null) {
-            heartbeatScheduler.shutdown();
+        // Keep the executor alive so the poller can be started again. Continue
+        // heartbeats while active tasks drain, then stop the heartbeat scheduler.
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+        while (hasInFlightWork() && System.nanoTime() < deadline) {
             try {
-                if (!heartbeatScheduler.awaitTermination(5, TimeUnit.SECONDS)) {
-                    heartbeatScheduler.shutdownNow();
-                }
+                TimeUnit.MILLISECONDS.sleep(100);
             } catch (InterruptedException e) {
-                heartbeatScheduler.shutdownNow();
                 Thread.currentThread().interrupt();
+                break;
             }
         }
+        if (hasInFlightWork()) {
+            log.warn("Some tasks are still running after the graceful stop timeout; heartbeats remain active");
+        } else {
+            stopHeartbeatScheduler();
+        }
 
-        // Wait for in-flight tasks to complete
+        log.info("Task poller stopped");
+    }
+
+    /** Shut down resources when the Spring application context closes. */
+    @PreDestroy
+    public synchronized void shutdown() {
+        stop();
         taskProcessorExecutor.shutdown();
         try {
             if (!taskProcessorExecutor.awaitTermination(30, TimeUnit.SECONDS)) {
-                log.warn("Some tasks did not complete within timeout, forcing shutdown");
+                log.warn("Some tasks did not complete during application shutdown; forcing shutdown");
                 taskProcessorExecutor.shutdownNow();
             }
         } catch (InterruptedException e) {
             taskProcessorExecutor.shutdownNow();
             Thread.currentThread().interrupt();
+        } finally {
+            stopHeartbeatScheduler();
         }
+    }
 
-        log.info("Task poller stopped");
+    private void startHeartbeatSchedulerIfNeeded() {
+        if (heartbeatScheduler != null && !heartbeatScheduler.isShutdown()) {
+            return;
+        }
+        heartbeatScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "task-heartbeat");
+            t.setDaemon(true);
+            return t;
+        });
+        heartbeatScheduler.scheduleAtFixedRate(
+                this::sendHeartbeats,
+                properties.getHeartbeat().getIntervalMs(),
+                properties.getHeartbeat().getIntervalMs(),
+                TimeUnit.MILLISECONDS
+        );
+    }
+
+    private void stopHeartbeatScheduler() {
+        ScheduledExecutorService scheduler = heartbeatScheduler;
+        heartbeatScheduler = null;
+        if (scheduler == null) {
+            return;
+        }
+        scheduler.shutdown();
+        try {
+            if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
+                scheduler.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            scheduler.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private boolean hasInFlightWork() {
+        return !processingTasks.isEmpty()
+                || taskProcessorExecutor.getActiveCount() > 0
+                || !taskProcessorExecutor.getQueue().isEmpty();
     }
 
     /**
@@ -182,11 +219,11 @@ public class TaskPollerService {
             }
 
             int fetchSize = Math.min(currentBatchSize, availableCapacity);
-            List<Task> tasks = taskQueueService.dequeueTasks(fetchSize);
+            List<Task> tasks = taskQueueService.dequeueTasks(fetchSize, availableCapacityByType());
 
             if (tasks.isEmpty()) {
                 // Adaptive polling: increase interval when queue is empty
-                if (properties.getPoller().isAdaptivePolling()) {
+                if (properties.getPoller().isAdaptivePolling() && processingTasks.isEmpty()) {
                     long newInterval = Math.min(
                             currentPollInterval.get() * 2,
                             properties.getPoller().getMaxPollIntervalMs()
@@ -238,6 +275,16 @@ public class TaskPollerService {
         }
     }
 
+    private Map<String, Integer> availableCapacityByType() {
+        Map<String, Integer> activeByType = new ConcurrentHashMap<>();
+        processingTasks.values().forEach(handle ->
+                activeByType.merge(handle.task().getTaskType(), 1, Integer::sum));
+        Map<String, Integer> available = new ConcurrentHashMap<>();
+        properties.getPoller().getMaxConcurrentByType().forEach((taskType, maxActive) ->
+                available.put(taskType, Math.max(0, maxActive - activeByType.getOrDefault(taskType, 0))));
+        return available;
+    }
+
     /** Run one poll cycle, then schedule the next one using the latest interval. */
     private void pollAndScheduleNext() {
         try {
@@ -255,10 +302,6 @@ public class TaskPollerService {
      * tasks that have overrun their execution timeout.
      */
     private void sendHeartbeats() {
-        if (!running.get()) {
-            return;
-        }
-
         try {
             for (Map.Entry<String, ProcessingHandle> entry : processingTasks.entrySet()) {
                 Task task = entry.getValue().task();

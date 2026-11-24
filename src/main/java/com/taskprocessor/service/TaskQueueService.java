@@ -7,6 +7,7 @@ import com.taskprocessor.entity.TaskPriority;
 import com.taskprocessor.entity.TaskStatus;
 import com.taskprocessor.metrics.TaskMetrics;
 import com.taskprocessor.repository.TaskRepository;
+import com.taskprocessor.repository.TaskIdempotencyRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.Page;
@@ -17,6 +18,10 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -32,13 +37,21 @@ public class TaskQueueService {
     private final TaskRepository taskRepository;
     private final TaskProcessorProperties properties;
     private final TaskMetrics taskMetrics;
+    private final QueueAdmissionService queueAdmissionService;
+    private final TaskIdempotencyRepository idempotencyRepository;
 
     /**
      * Enqueue a single task
      */
     @Transactional
     public TaskResponse enqueueTask(CreateTaskRequest request) {
+        return enqueueTask(request, null);
+    }
+
+    @Transactional
+    public TaskResponse enqueueTask(CreateTaskRequest request, String idempotencyKey) {
         Task task = Task.builder()
+                .id(UUID.randomUUID())
                 .taskType(request.getTaskType())
                 .payload(request.getPayload())
                 .priority(request.getPriority() != null ? request.getPriority() : TaskPriority.MEDIUM)
@@ -52,6 +65,27 @@ public class TaskQueueService {
                         ? TaskStatus.SCHEDULED : TaskStatus.PENDING)
                 .scheduledAt(request.getScheduledAt())
                 .build();
+
+        if (idempotencyKey != null) {
+            if (idempotencyKey.isBlank() || idempotencyKey.length() > 255) {
+                throw new IllegalArgumentException("Idempotency-Key must contain 1 to 255 characters");
+            }
+            String requestHash = fingerprint(task);
+            int reserved = idempotencyRepository.reserve(idempotencyKey, requestHash, task.getId());
+            if (reserved == 0) {
+                var existingRecord = idempotencyRepository.findById(idempotencyKey)
+                        .orElseThrow(() -> new IllegalStateException("Idempotency record disappeared"));
+                if (!existingRecord.getRequestHash().equals(requestHash)) {
+                    throw new IdempotencyConflictException(
+                            "Idempotency-Key was already used for a different task request");
+                }
+                return taskRepository.findById(existingRecord.getTaskId())
+                        .map(TaskResponse::fromEntity)
+                        .orElseThrow(() -> new IllegalStateException("Idempotent task record is missing"));
+            }
+        }
+
+        queueAdmissionService.assertCanAccept(List.of(task));
 
         task = taskRepository.save(task);
         taskMetrics.recordTaskEnqueued(task.getTaskType());
@@ -80,6 +114,8 @@ public class TaskQueueService {
                         .build())
                 .collect(Collectors.toList());
 
+        queueAdmissionService.assertCanAccept(tasks);
+
         tasks = taskRepository.saveAll(tasks);
         
         tasks.forEach(task -> taskMetrics.recordTaskEnqueued(task.getTaskType()));
@@ -102,6 +138,11 @@ public class TaskQueueService {
      */
     @Transactional
     public List<Task> dequeueTasks(int batchSize) {
+        return dequeueTasks(batchSize, Collections.emptyMap());
+    }
+
+    @Transactional
+    public List<Task> dequeueTasks(int batchSize, Map<String, Integer> availableCapacityByType) {
         int candidatePoolSize = Math.min(
                 batchSize * properties.getPoller().getFairnessCandidateMultiplier(),
                 properties.getPoller().getMaxFairnessCandidates());
@@ -112,7 +153,7 @@ public class TaskQueueService {
             return Collections.emptyList();
         }
 
-        List<Task> selected = selectFairBatch(candidates, batchSize);
+        List<Task> selected = selectFairBatch(candidates, batchSize, availableCapacityByType);
 
         Instant now = Instant.now();
         String workerId = properties.getWorkerId();
@@ -138,7 +179,8 @@ public class TaskQueueService {
      * priority DESC, created_at ASC, so grouping in encounter order naturally yields
      * priority tiers from highest to lowest, and per-type FIFO order within each tier.
      */
-    private List<Task> selectFairBatch(List<Task> candidates, int batchSize) {
+    private List<Task> selectFairBatch(List<Task> candidates, int batchSize,
+                                       Map<String, Integer> availableCapacityByType) {
         LinkedHashMap<TaskPriority, LinkedHashMap<String, ArrayDeque<Task>>> byPriority = new LinkedHashMap<>();
         for (Task task : candidates) {
             byPriority
@@ -148,6 +190,7 @@ public class TaskQueueService {
         }
 
         List<Task> result = new ArrayList<>(Math.min(batchSize, candidates.size()));
+        Map<String, Integer> selectedByType = new HashMap<>();
 
         for (LinkedHashMap<String, ArrayDeque<Task>> byType : byPriority.values()) {
             if (result.size() >= batchSize) {
@@ -163,9 +206,18 @@ public class TaskQueueService {
                     if (result.size() >= batchSize) {
                         break;
                     }
+                    Task head = queue.peekFirst();
+                    if (head == null) {
+                        continue;
+                    }
+                    int typeCapacity = availableCapacityByType.getOrDefault(head.getTaskType(), batchSize);
+                    if (selectedByType.getOrDefault(head.getTaskType(), 0) >= typeCapacity) {
+                        continue;
+                    }
                     Task next = queue.pollFirst();
                     if (next != null) {
                         result.add(next);
+                        selectedByType.merge(next.getTaskType(), 1, Integer::sum);
                         progressed = true;
                     }
                 }
@@ -173,6 +225,31 @@ public class TaskQueueService {
         }
 
         return result;
+    }
+
+    private String fingerprint(Task task) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            updateDigest(digest, task.getTaskType());
+            updateDigest(digest, task.getPayload());
+            updateDigest(digest, task.getPriority().name());
+            updateDigest(digest, task.getMaxAttempts().toString());
+            updateDigest(digest, task.getTimeoutSeconds().toString());
+            updateDigest(digest, task.getScheduledAt() == null ? null : task.getScheduledAt().toString());
+            return HexFormat.of().formatHex(digest.digest());
+        } catch (NoSuchAlgorithmException impossible) {
+            throw new IllegalStateException("SHA-256 is unavailable", impossible);
+        }
+    }
+
+    private void updateDigest(MessageDigest digest, String value) {
+        if (value == null) {
+            digest.update(ByteBuffer.allocate(Integer.BYTES).putInt(-1).array());
+            return;
+        }
+        byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
+        digest.update(ByteBuffer.allocate(Integer.BYTES).putInt(bytes.length).array());
+        digest.update(bytes);
     }
 
     /**
@@ -209,13 +286,16 @@ public class TaskQueueService {
                 return;
             }
             if (task.getAttemptCount() < task.getMaxAttempts()) {
-                // Schedule for retry
-                task.setStatus(TaskStatus.PENDING);
+                long delayMs = RetryDelayCalculator.delayMillis(task.getAttemptCount(),
+                        properties.getRetry().getInitialDelayMs(), properties.getRetry().getMaxDelayMs(),
+                        properties.getRetry().getJitterFactor());
+                task.setStatus(TaskStatus.SCHEDULED);
+                task.setScheduledAt(Instant.now().plusMillis(delayMs));
                 task.setWorkerId(null);
                 task.setLastHeartbeat(null);
                 task.setErrorMessage(errorMessage);
-                log.info("Task {} failed, scheduling retry (attempt {}/{})", 
-                        taskId, task.getAttemptCount(), task.getMaxAttempts());
+                log.info("Task {} failed, retry scheduled in {}ms (attempt {}/{})",
+                        taskId, delayMs, task.getAttemptCount(), task.getMaxAttempts());
             } else {
                 // Max retries exceeded
                 task.setStatus(TaskStatus.FAILED);
@@ -245,6 +325,30 @@ public class TaskQueueService {
     public Optional<TaskResponse> getTask(UUID taskId) {
         return taskRepository.findById(taskId)
                 .map(TaskResponse::fromEntity);
+    }
+
+    /** Create a fresh execution from a failed task while retaining the failed record. */
+    @Transactional
+    public Optional<TaskResponse> replayFailedTask(UUID taskId) {
+        return taskRepository.findByIdForUpdate(taskId).map(failedTask -> {
+            if (failedTask.getStatus() != TaskStatus.FAILED) {
+                throw new TaskNotReplayableException("Only failed tasks can be replayed");
+            }
+            Task replay = Task.builder()
+                    .taskType(failedTask.getTaskType())
+                    .payload(failedTask.getPayload())
+                    .priority(failedTask.getPriority())
+                    .maxAttempts(failedTask.getMaxAttempts())
+                    .timeoutSeconds(failedTask.getTimeoutSeconds())
+                    .status(TaskStatus.PENDING)
+                    .scheduledAt(Instant.now())
+                    .replayOfTaskId(failedTask.getId())
+                    .build();
+            queueAdmissionService.assertCanAccept(List.of(replay));
+            Task saved = taskRepository.save(replay);
+            taskMetrics.recordTaskEnqueued(saved.getTaskType());
+            return TaskResponse.fromEntity(saved);
+        });
     }
 
     /**

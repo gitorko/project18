@@ -4,11 +4,15 @@ import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.ResponseEntity;
 import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import com.taskprocessor.service.IdempotencyConflictException;
+import com.taskprocessor.service.QueueCapacityExceededException;
+import com.taskprocessor.service.TaskNotReplayableException;
 
 import java.time.Instant;
 import java.util.HashMap;
@@ -20,6 +24,22 @@ import java.util.Map;
 @Slf4j
 @RestControllerAdvice
 public class GlobalExceptionHandler {
+
+    @ExceptionHandler(QueueCapacityExceededException.class)
+    public ResponseEntity<ErrorResponse> handleQueueCapacity(QueueCapacityExceededException ex) {
+        ErrorResponse response = new ErrorResponse(
+                HttpStatus.SERVICE_UNAVAILABLE.value(), "Queue capacity exceeded", ex.getMessage(), Instant.now());
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                .header(HttpHeaders.RETRY_AFTER, "5")
+                .body(response);
+    }
+
+    @ExceptionHandler({IdempotencyConflictException.class, TaskNotReplayableException.class})
+    public ResponseEntity<ErrorResponse> handleConflict(RuntimeException ex) {
+        ErrorResponse response = new ErrorResponse(
+                HttpStatus.CONFLICT.value(), "Conflict", ex.getMessage(), Instant.now());
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(response);
+    }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
     public ResponseEntity<ErrorResponse> handleValidationException(MethodArgumentNotValidException ex) {

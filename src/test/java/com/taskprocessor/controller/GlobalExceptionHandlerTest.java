@@ -5,6 +5,8 @@ import org.springframework.http.HttpStatus;
 import org.springframework.validation.BeanPropertyBindingResult;
 import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
+import com.taskprocessor.service.QueueCapacityExceededException;
+import com.taskprocessor.service.IdempotencyConflictException;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -33,5 +35,16 @@ class GlobalExceptionHandlerTest {
         var response = handler.handleGenericException(new IllegalStateException("secret detail"));
         assertEquals(HttpStatus.INTERNAL_SERVER_ERROR, response.getStatusCode());
         assertEquals("An unexpected error occurred", response.getBody().getMessage());
+    }
+
+    @Test void mapsCapacityFailureToRetryableServiceUnavailable() {
+        var response = handler.handleQueueCapacity(new QueueCapacityExceededException("queue is full"));
+        assertEquals(HttpStatus.SERVICE_UNAVAILABLE, response.getStatusCode());
+        assertEquals("5", response.getHeaders().getFirst("Retry-After"));
+    }
+
+    @Test void mapsIdempotencyMismatchToConflict() {
+        var response = handler.handleConflict(new IdempotencyConflictException("key reused"));
+        assertEquals(HttpStatus.CONFLICT, response.getStatusCode());
     }
 }

@@ -8,9 +8,9 @@ A distributed task queue implementation using Spring Boot and PostgreSQL. Simila
 - **Configurable Thread Pool**: Dynamically adjust processing capacity at runtime
 - **Adaptive Polling**: Reduces DB load when queue is empty
 - **Heartbeat Mechanism**: Detects and recovers stuck tasks from crashed workers
-- **Retry Support**: Configurable retry attempts for failed tasks
+- **Retry Support**: Exponential retry delay with jitter and manual replay of failed tasks
 - **Priority Queue**: Higher priority tasks are processed first
-- **Scheduled Tasks**: Support for delayed task execution
+- **Scheduled Tasks**: Run once at a specified time or repeat on a fixed-delay interval
 - **Metrics**: Spring Actuator metrics for monitoring processing rate and performance
 - **REST API**: Full API for task management and configuration
 
@@ -18,25 +18,67 @@ A distributed task queue implementation using Spring Boot and PostgreSQL. Simila
 
 ### Prerequisites
 
-- Java 17+
-- PostgreSQL 12+
-- Gradle 8+
+- JDK 17 or newer for local builds and runs (the Docker image uses JDK 21 to build)
+- Docker with Docker Compose, or a PostgreSQL 12+ instance
 
-### Setup
+### Build and test
 
-1. Start PostgreSQL (using Docker Compose):
+The Gradle wrapper downloads and uses the project's pinned Gradle version, so a
+separate Gradle installation is not required. From the repository root, build
+the application and run the unit tests:
 
 ```bash
-docker-compose up -d postgres
+./gradlew clean build
 ```
 
-2. Build and run the application:
+The executable Spring Boot JAR is created under `build/libs/`. To run only the
+unit tests:
 
 ```bash
+./gradlew test
+```
+
+If the Gradle wrapper download fails with a TLS `Broken pipe` error, force Java
+to use IPv4 for the download and build:
+
+```bash
+JAVA_TOOL_OPTIONS="-Djava.net.preferIPv4Stack=true" ./gradlew clean build
+```
+
+### Run locally
+
+1. Start PostgreSQL with Docker Compose:
+
+```bash
+docker compose up -d postgres
+```
+
+2. Start the application, pointing it at the database created by Compose:
+
+```bash
+SPRING_DATASOURCE_URL=jdbc:postgresql://localhost:5432/taskprocessor \
+SPRING_DATASOURCE_USERNAME=postgres \
+SPRING_DATASOURCE_PASSWORD=postgres \
 ./gradlew bootRun
 ```
 
-3. The application will be available at `http://localhost:8080`
+The API is available at `http://localhost:8080`. The environment variables
+match the database credentials in `docker-compose.yml`; set the corresponding
+Spring datasource properties if using a different PostgreSQL instance.
+
+### Build the Docker image
+
+The Dockerfile builds the JAR in a JDK 21 builder image and runs it on a JRE 21
+image. Build the image with:
+
+```bash
+docker build -t task-processor:local .
+```
+
+To run that image, configure `SPRING_DATASOURCE_URL`,
+`SPRING_DATASOURCE_USERNAME`, and `SPRING_DATASOURCE_PASSWORD` to point to your
+PostgreSQL instance. When PostgreSQL runs in Docker Compose, use the Compose
+service name `postgres` as the database host for a containerized app.
 
 ## API Reference
 
@@ -45,10 +87,14 @@ docker-compose up -d postgres
 #### Create a Task
 
 Priority is a named value: `LOW`, `MEDIUM` (the default), or `HIGH`.
+Higher-priority work is selected first. Within a priority, tasks are shared
+between task types in round-robin order. A sustained stream of `HIGH` tasks can
+delay `MEDIUM` and `LOW` work, so use priority levels deliberately.
 
 ```bash
 POST /api/v1/tasks
 Content-Type: application/json
+Idempotency-Key: send-email-123
 
 {
   "taskType": "sample",
@@ -57,6 +103,60 @@ Content-Type: application/json
   "maxAttempts": 3
 }
 ```
+
+For a one-time delayed task, include `scheduledAt` as an ISO-8601 timestamp. The
+dispatcher promotes it into the runnable queue when that time arrives.
+
+```json
+{
+  "taskType": "send-report",
+  "payload": "{\"reportId\":\"RPT-123\"}",
+  "scheduledAt": "2026-11-25T09:00:00Z"
+}
+```
+
+For `POST /api/v1/tasks`, an optional `Idempotency-Key` header makes client
+retries safe when a response is lost. Repeating the same key and request returns
+the original task instead of enqueuing another one. Reusing a key with a
+different request returns `409 Conflict`. Bulk creation does not currently
+support idempotency keys.
+
+This protects task acceptance only. It does not guarantee exactly-once execution
+of handler side effects: after a worker crash, a task may run again. Handlers
+that call external services should be safe to repeat or pass an idempotency key
+to those services.
+
+#### Create a Recurring Schedule
+
+Use a recurring schedule when the same task should run repeatedly. Each run gets
+its own task ID and history. The interval is a fixed delay after the previous
+run finishes, so slow runs do not overlap and downtime does not create a
+catch-up burst. Retries for one occurrence finish before the next interval
+starts.
+
+```bash
+POST /api/v1/schedules
+Content-Type: application/json
+
+{
+  "taskType": "refresh-cache",
+  "payload": "{}",
+  "priority": "MEDIUM",
+  "scheduledAt": "2026-11-25T09:00:00Z",
+  "intervalSeconds": 3600,
+  "maxAttempts": 3
+}
+```
+
+The response includes a schedule ID, the next run time, and the active task ID
+when an occurrence is queued or running. Retrieve a schedule with
+`GET /api/v1/schedules/{scheduleId}` and stop future runs with
+`DELETE /api/v1/schedules/{scheduleId}`. Cancelling a schedule also cancels its
+queued occurrence; an already running task is allowed to finish.
+
+Recurring schedules use fixed-delay intervals; cron expressions and
+time-zone-based calendars are not supported. `intervalSeconds` must be between
+1 second and 1 year.
 
 #### Create Tasks in Bulk
 
@@ -117,12 +217,57 @@ Response:
 }
 ```
 
+#### Backpressure guidance
+
+The summary endpoint can help a client pace submissions. Check `pendingTasks`,
+per-type pending counts, and `estimatedBacklogCompletionSeconds`; if the queue
+is growing or the estimated drain time is too high, pause or reduce submissions.
+Using separate “slow down” and “resume” thresholds helps avoid repeatedly
+switching pace as the count moves around one boundary.
+
+The processor also enforces an outstanding-task limit. It defaults to 10,000
+and counts `PENDING`, `PROCESSING`, and `SCHEDULED` task rows. Configure
+`task-processor.admission.max-outstanding-tasks` or set it to `0` to disable the
+global cap. Optional task-type caps are configured under
+`task-processor.admission.max-outstanding-by-type`:
+
+```yaml
+task-processor:
+  admission:
+    max-outstanding-tasks: 20000
+    max-outstanding-by-type:
+      REPORT: 100
+      EMAIL: 2000
+```
+
+Admission checks are serialized in PostgreSQL, so concurrent requests and
+worker instances cannot pass the same stale count check. If a submission would
+exceed a limit, the API returns `503 Service Unavailable` with
+`Retry-After: 5`; bulk submissions are rejected as a whole. Due recurring runs
+wait to enter the queue until capacity is available. Clients can use the summary
+to slow down before the hard limit is reached, but counts remain a snapshot.
+Queue depth is database-backed, while throughput and ETA inputs are
+process-local estimates.
+
 `estimatedBacklogCompletionSeconds` is an approximate drain time calculated
 from pending plus running tasks, the average successful runtime observed by
 this process, and the current worker pool size. It is `null` until the process
-has completed tasks and collected runtime samples. Scheduled tasks are excluded
-until they become runnable; estimates do not account for future submissions,
-priority tiers, or differences in the remaining runtime of active tasks.
+has completed tasks and collected runtime samples. Scheduled tasks and future
+recurring occurrences are excluded until runnable; estimates do not account for
+future submissions, priority tiers, or remaining runtime of active tasks.
+
+#### Replay a Failed Task
+
+Tasks with `FAILED` status remain available as dead-letter records:
+
+```bash
+GET /api/v1/tasks?status=FAILED
+POST /api/v1/tasks/{taskId}/replay
+```
+
+Replay creates a new pending task linked to the failed record through
+`replayOfTaskId`; the original failure remains unchanged. Only failed tasks can
+be replayed.
 
 #### Cancel a Task
 
@@ -131,6 +276,24 @@ DELETE /api/v1/tasks/{taskId}
 ```
 
 ### Poller Configuration
+
+The shared executor can be paired with per-task-type active-task caps. For
+example, to keep CPU-heavy report work from taking all the threads on each
+worker, set:
+
+```yaml
+task-processor:
+  poller:
+    pool-size: 8
+    max-concurrent-by-type:
+      REPORT: 2
+      EMAIL: 6
+```
+
+These are per-instance limits: with three worker instances, `REPORT: 2` allows
+up to six report tasks across the deployment. Types without a configured cap
+can use any available executor slot. This is workload isolation within a shared
+pool; it does not create separate executors or reserve threads for a type.
 
 #### Get Current Configuration
 
@@ -189,12 +352,45 @@ task-processor:
     batch-size: 10         # Tasks per poll
     poll-interval-ms: 1000 # Base poll interval
     adaptive-polling: true # Reduce polling when queue empty
+    # Optional per-instance active-task caps by type:
+    # max-concurrent-by-type:
+    #   REPORT: 2
+    #   EMAIL: 10
+
+  retry:
+    initial-delay-ms: 1000
+    max-delay-ms: 60000
+    jitter-factor: 0.2
+
+  admission:
+    max-outstanding-tasks: 10000
+    max-outstanding-by-type: {}
   
   heartbeat:
     interval-ms: 5000      # Heartbeat frequency
     stale-threshold-ms: 30000  # When to consider task stuck
     recovery-interval-ms: 10000 # Stale task check frequency
 ```
+
+Additional settings and defaults:
+
+| Setting | Default | Purpose |
+| --- | ---: | --- |
+| `poller.min-poll-interval-ms` | 100 ms | Poll interval after finding work. |
+| `poller.max-poll-interval-ms` | 5,000 ms | Maximum empty-queue backoff. |
+| `poller.fairness-candidate-multiplier` | 5 | Candidate rows fetched per requested batch slot. |
+| `poller.max-fairness-candidates` | 200 | Maximum candidate rows considered for fairness. |
+| `poller.default-task-timeout-seconds` | 120 s | Timeout for tasks without an override. |
+| `poller.max-concurrent-by-type` | empty | Optional per-worker active-task caps by type. |
+| `scheduler.poll-interval-ms` | 1,000 ms | How often due tasks and recurring schedules are dispatched. |
+| `retry.initial-delay-ms` | 1,000 ms | Initial retry backoff delay. |
+| `retry.max-delay-ms` | 60,000 ms | Maximum retry backoff before jitter. |
+| `retry.jitter-factor` | 0.2 | Proportional random spread added to retry delays. |
+| `admission.max-outstanding-tasks` | 10,000 | Global pending, processing, and scheduled task limit; `0` disables it. |
+| `admission.max-outstanding-by-type` | empty | Optional outstanding-task limits by type. |
+| `heartbeat.interval-ms` | 5,000 ms | Worker heartbeat interval. |
+| `heartbeat.stale-threshold-ms` | 30,000 ms | Time without heartbeat before a task is stale. |
+| `heartbeat.recovery-interval-ms` | 10,000 ms | How often stale tasks are recovered. |
 
 ### Environment Variables
 
@@ -234,41 +430,248 @@ curl -X PUT http://localhost:8080/api/v1/poller/config \
 
 4. **Deploy Multiple Pods**: Each pod will independently process tasks without conflicts.
 
-## How It Works
+## Architecture and Runtime Behavior
 
-### Distributed Locking with SKIP LOCKED
+This section describes how the backend components work together, including
+queue selection, execution limits, retries, and recovery. PostgreSQL is both
+the durable task store and the coordination mechanism; no separate message
+broker is required.
 
-The key to preventing duplicate processing is PostgreSQL's `SKIP LOCKED`:
+### Main Components
+
+| Component | Responsibility |
+| --- | --- |
+| `TaskController` | Task creation, bulk creation, lookup, pagination, summary, cancellation, replay, and this worker's processing list. |
+| `TaskScheduleController` | Create, inspect, and cancel recurring schedules. |
+| `PollerController` | Read and update local poller configuration and status; start or stop polling. |
+| `TaskQueueService` | Persist, select, claim, finalize, retry, cancel, replay, and summarize tasks. |
+| `QueueAdmissionService` | Enforce global and per-type outstanding-task limits across workers. |
+| `TaskPollerService` | Poll for work, submit it to the executor, maintain heartbeats, and enforce timeouts. |
+| `TaskProcessorService` | Resolve a `TaskHandler`, execute it, and report success or failure. |
+| `ScheduledTaskService` | Promote due tasks and materialize recurring occurrences. |
+| `StaleTaskRecoveryService` | Reset stale in-flight work or mark exhausted tasks as failed. |
+| `TaskRepository` | JPA and PostgreSQL-specific queue operations, including `FOR UPDATE SKIP LOCKED`. |
+| `TaskMetrics` | Micrometer counters, timers, gauges, and process-local runtime/rate samples. |
+
+### Task Lifecycle and Delivery
+
+```text
+POST /api/v1/tasks
+        |
+        v
+     PENDING --claim--> PROCESSING --success--> COMPLETED
+                            |  \
+                            |   +-- failure with attempts left --> SCHEDULED
+                            |                                      (retry delay)
+                            +-- attempts exhausted -------------> FAILED
+
+     PROCESSING --worker heartbeat expires, attempts remain-----> PENDING
+```
+
+`attemptCount` increases when a worker claims a task. A handler failure with
+attempts remaining changes the task to `SCHEDULED` until the backoff delay
+expires; retries are not immediate. Stale-worker recovery returns a task to
+`PENDING` without incrementing the attempt count again. At the attempt limit,
+the task becomes `FAILED`.
+
+Task completion and failure lock the row and check its `PROCESSING` state and
+attempt number. This prevents a late result from an older attempt overwriting a
+newer attempt's state. Delivery is **at least once**: a worker can perform an
+external side effect and stop before recording completion, so a task may run
+again. Handlers should be safe to repeat or use idempotency with external
+services.
+
+### Additional API Endpoints and Validation
+
+Task creation, lookup, schedules, queue summaries, and replay are described in
+the API sections above. The remaining worker-control endpoints are:
+
+| Endpoint | Behavior |
+| --- | --- |
+| `GET /api/v1/tasks/processing` | List tasks assigned to this worker ID. |
+| `GET /api/v1/poller/config` | Return this process's pool size, batch size, poll interval, enabled state, active threads, heartbeat settings, and worker ID. |
+| `PUT /api/v1/poller/config` | Update pool size, batch size, poll interval, or enabled state for this process. |
+| `GET /api/v1/poller/status` | Return local poller and executor state, including active tasks and executor queue size. |
+| `POST /api/v1/poller/start` | Start the poller if it is stopped. |
+| `POST /api/v1/poller/stop` | Stop polling and wait for in-flight tasks to drain; the executor remains available for a later start. |
+
+Runtime controls affect only the worker instance that receives the request.
+Configure each instance separately when its hardware capacity differs.
+
+Request validation requires a nonblank task type; `maxAttempts` from 1 to 10
+when supplied; timeouts of at least one second; intervals from one second to
+one year; and no more than 1,000 tasks per bulk request. Poller updates allow
+pool and batch sizes from 1 to 100 and poll intervals from 100 to 60,000 ms.
+Validation errors return `400 Bad Request`; an idempotency conflict or an
+attempt to replay a nonfailed task returns `409 Conflict`.
+
+### PostgreSQL Queue Claims, Priority, and Fairness
+
+Each worker selects candidate rows in a transaction using PostgreSQL row locks:
 
 ```sql
-SELECT * FROM tasks 
-WHERE status = 'PENDING' 
-ORDER BY priority DESC, created_at ASC 
-LIMIT 10 
+SELECT * FROM tasks
+WHERE status = 'PENDING'
+  AND scheduled_at <= :now
+ORDER BY priority DESC, created_at ASC
+LIMIT :candidatePoolSize
 FOR UPDATE SKIP LOCKED
 ```
 
-This query:
-1. Locks rows that are returned
-2. Skips rows already locked by other transactions
-3. Ensures no two workers get the same task
+`SKIP LOCKED` lets concurrent workers claim different rows without a separate
+leader or distributed lock. The lock is held only while the transaction marks
+selected rows `PROCESSING`, stores the worker ID and timestamps, and increments
+`attemptCount`; it is released before handlers run.
 
-### Heartbeat and Recovery
+Only `PENDING` rows are candidates for polling. Rows marked `FAILED` stay in the
+database for inspection and are excluded from the claim query and its partial
+pending-task index, even when there are many failed rows. A failed task runs
+again only through the explicit replay endpoint, which creates a new pending
+task.
 
-1. Workers send heartbeats every 5 seconds for tasks they're processing
-2. A background job checks for tasks with stale heartbeats (>30 seconds)
-3. Stale tasks are either:
-   - Reset to PENDING for retry (if attempts remain)
-   - Marked as FAILED (if max attempts exceeded)
+The candidate pool is `batchSize * fairnessCandidateMultiplier`, capped by
+`maxFairnessCandidates` (defaults: batch size 10, multiplier 5, cap 200). The
+queue service selects the highest priority tier first, then shares that tier
+across task types in round-robin order, preserving creation-time order within
+each type. Lower-priority candidates are used only if higher-priority
+candidates do not fill the batch. Unselected rows remain pending.
 
-### Adaptive Polling
+Fairness applies only to task types in the bounded candidate window. Tasks
+beyond that window cannot take part in that poll's round-robin selection. A
+continuous stream of higher-priority work can starve lower-priority tasks.
+Priority is stored as a numeric rank in PostgreSQL for ordering, while API
+clients use the `HIGH`, `MEDIUM`, and `LOW` enum names.
 
-To reduce database load:
-1. When tasks are found, poll interval is minimized (100ms)
-2. When queue is empty, interval doubles up to max (5000ms)
-3. This reduces unnecessary DB queries during idle periods
+### Polling and Execution Capacity
+
+The poller runs one polling cycle at a time. With adaptive polling enabled, an
+empty queue doubles the interval up to `max-poll-interval-ms` (5,000 ms by
+default); finding tasks resets it to `min-poll-interval-ms` (100 ms by
+default). The first interval is `poll-interval-ms` (1,000 ms by default).
+When adaptive polling is disabled, empty polls do not change the interval.
+Runtime updates take effect after the current poll cycle completes.
+
+Each worker has one thread pool with a bounded 1,000-task executor queue. The
+poller calculates available claim capacity as:
+
+```text
+corePoolSize - activeThreadCount - executorQueueSize
+```
+
+It claims at most that capacity and the configured batch size, avoiding
+intentional local executor backlog. `poolSize` changes the executor's core
+size. Although `maxPoolSize` is configurable, normal polling is limited by
+available core capacity, so it does not automatically scale execution above
+the core size. In practice, set `poolSize` to the concurrency you want.
+
+Per-type active-task caps are enforced independently on each worker, not across
+the cluster. All types share one executor; there are no separate per-type
+executors, automatic CPU-based resizing, or cluster-wide resource limits. For
+CPU-bound handlers, use a pool suited to the worker's cores. I/O-bound handlers
+may benefit from more concurrent threads.
+
+### Scheduled Tasks
+
+A future one-time task is saved with `SCHEDULED` status. Distributed dispatchers
+promote due rows to `PENDING` in bounded batches using `FOR UPDATE SKIP LOCKED`,
+so multiple instances can safely run the dispatcher.
+
+An interval schedule stores one task definition and creates a separate task
+row for each occurrence. The next occurrence is materialized only after the
+current one reaches a terminal state, including after retries. Its fixed delay
+starts after that completion, preventing overlap and catch-up bursts after
+downtime. Due recurring occurrences wait when admission capacity is full.
+Cancellation disables future occurrences and cancels a queued occurrence; an
+already running handler is allowed to finish.
+
+Scheduled dispatch runs every second by default, configurable with
+`task-processor.scheduler.poll-interval-ms`. Cron expressions and
+time-zone-based calendars are not supported.
+
+### Handler Routing, Timeouts, and Recovery
+
+Implement `TaskHandler` and register it as a Spring bean. Tasks are routed by
+`getTaskType()`. If no specific handler matches, `DefaultTaskHandler` is used
+when available; otherwise the task fails. The built-in default handler is a
+sample that logs the task and returns successfully, so an unregistered task
+type can be marked `COMPLETED` without doing its intended work. Register a real
+handler for every task type or replace the default handler in production. A
+handler receives the persisted task, including its JSON text payload.
+
+Each task can specify `timeoutSeconds`; otherwise the configured default is
+120 seconds. On timeout, the poller requests cancellation with
+`Future.cancel(true)` and records a task failure. Java cannot forcibly stop
+code that ignores interruption. Use client-side I/O timeouts and
+interruption-aware handlers. Non-interruptible code may continue occupying its
+thread even after the database task is retried or failed.
+
+Workers update `last_heartbeat` for tracked tasks every 5 seconds by default.
+A separate recovery process runs every 10 seconds and considers a processing
+task stale after 30 seconds without a heartbeat. Stale tasks with attempts
+remaining return to `PENDING`; tasks at their attempt limit become `FAILED`.
+Recovery does not increment attempts. A paused worker can miss the stale
+threshold and have its task reclaimed elsewhere, so duplicate execution must
+be expected.
+
+Retries use exponential backoff from `retry.initial-delay-ms` up to
+`retry.max-delay-ms`, with randomized jitter. Defaults are one second, 60
+seconds, and 20% jitter. `maxAttempts` includes the first attempt and defaults
+to one, so retries are opt-in. Failed rows remain available for inspection and
+replay. Replay creates a new task linked through `replayOfTaskId`; the original
+failure is preserved. Only the latest error is stored; per-attempt history and
+stack traces are not persisted.
+
+### Metrics and Summary Estimates
+
+`GET /api/v1/tasks/summary` reports task totals by status, pending counts by
+type, lifecycle counts and average successful runtime by type, processing
+rate, active threads, pool size, and `estimatedBacklogCompletionSeconds`.
+The estimate is approximately:
+
+```text
+(pending tasks + processing tasks) * process-local average runtime
+-------------------------------------------------------------------
+                    configured core pool size
+```
+
+It is `null` until the process has successful runtime samples. Scheduled tasks
+are excluded. The estimate does not account for future submissions, task-type
+runtime differences, priority, or remaining time on current tasks. Queue
+counts come from PostgreSQL; processing rate and runtime samples are local to
+each process. Multi-worker estimates are not a cluster-wide capacity forecast.
+
+Spring Actuator exposes health, metrics, and Prometheus endpoints. Micrometer
+records enqueue, completion, failure, and poll counters; per-type counters;
+processing timers (including aggregate p50/p95/p99 percentiles); per-type
+timers; and active-processing, executor-pool, active-thread, and local-queue
+gauges. `tasks.failed` counts terminal handler/timeout failures, not each
+intermediate retry. Tasks marked failed by bulk stale recovery appear in
+database summaries but do not currently increment Micrometer failure counters.
+
+### Operational Limitations
+
+- PostgreSQL is the only queue storage implementation; there is no separate
+  broker adapter.
+- Completed and failed tasks have no built-in retention or cleanup policy and
+  continue contributing to storage and summary totals.
+- Idempotency keys apply to single-task creation, not bulk submissions.
+- The REST API has no built-in authentication or authorization.
+- Recurring schedules support fixed-delay intervals, not cron or calendar
+  schedules.
+- Running tasks cannot be cancelled through the task API; timeout handling
+  requests best-effort interruption.
+- Strict priority can starve lower-priority work; fairness only covers types
+  present in the bounded candidate pool.
+- Metrics and runtime averages are process-local; there is no shared worker
+  registry or cross-node CPU/memory view.
+- Queueing and retries provide at-least-once execution, not exactly-once
+  external side effects.
 
 ## Creating Custom Task Handlers
+
+Implement `TaskHandler` as a Spring bean. The processor routes each task by
+`getTaskType()` and passes the persisted task, including its payload, to the
+matching handler:
 
 ```java
 @Component
@@ -281,27 +684,18 @@ public class EmailTaskHandler implements TaskHandler {
 
     @Override
     public void handle(Task task) throws Exception {
-        // Parse payload
         EmailPayload payload = objectMapper.readValue(
-            task.getPayload(), 
-            EmailPayload.class
-        );
-        
-        // Send email
+                task.getPayload(), EmailPayload.class);
         emailService.send(payload);
     }
 }
 ```
 
-Then enqueue tasks with that type:
-```bash
-POST /api/v1/tasks
+Then submit a task with that `taskType`:
+
+```json
 {
   "taskType": "send-email",
   "payload": "{\"to\": \"user@example.com\", \"subject\": \"Hello\"}"
 }
-```
-
-```
-locust -f locustfile.py
 ```

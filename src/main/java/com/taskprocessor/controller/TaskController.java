@@ -29,8 +29,10 @@ public class TaskController {
      * Enqueue a single task
      */
     @PostMapping
-    public ResponseEntity<TaskResponse> createTask(@Valid @RequestBody CreateTaskRequest request) {
-        TaskResponse task = taskQueueService.enqueueTask(request);
+    public ResponseEntity<TaskResponse> createTask(
+            @Valid @RequestBody CreateTaskRequest request,
+            @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey) {
+        TaskResponse task = taskQueueService.enqueueTask(request, idempotencyKey);
         return ResponseEntity.status(HttpStatus.CREATED).body(task);
     }
 
@@ -86,6 +88,14 @@ public class TaskController {
             return ResponseEntity.noContent().build();
         }
         return ResponseEntity.notFound().build();
+    }
+
+    /** Replay a failed task as a new task row, retaining the failed task for inspection. */
+    @PostMapping("/{taskId}/replay")
+    public ResponseEntity<TaskResponse> replayTask(@PathVariable UUID taskId) {
+        return taskQueueService.replayFailedTask(taskId)
+                .map(task -> ResponseEntity.status(HttpStatus.CREATED).body(task))
+                .orElse(ResponseEntity.notFound().build());
     }
 
     /**

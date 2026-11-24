@@ -6,7 +6,9 @@ import com.taskprocessor.dto.TaskResponse;
 import com.taskprocessor.entity.Task;
 import com.taskprocessor.entity.TaskPriority;
 import com.taskprocessor.entity.TaskStatus;
+import com.taskprocessor.entity.TaskIdempotencyRecord;
 import com.taskprocessor.metrics.TaskMetrics;
+import com.taskprocessor.repository.TaskIdempotencyRepository;
 import com.taskprocessor.repository.TaskRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -31,13 +33,15 @@ import static org.mockito.Mockito.*;
 class TaskQueueServiceTest {
     @Mock TaskRepository repository;
     @Mock TaskMetrics metrics;
+    @Mock QueueAdmissionService admissionService;
+    @Mock TaskIdempotencyRepository idempotencyRepository;
     private TaskProcessorProperties properties;
     private TaskQueueService service;
 
     @BeforeEach void setUp() {
         properties = new TaskProcessorProperties();
         properties.setWorkerId("worker-1");
-        service = new TaskQueueService(repository, properties, metrics);
+        service = new TaskQueueService(repository, properties, metrics, admissionService, idempotencyRepository);
     }
 
     @Test void enqueueUsesDefaultsAndTracksMetric() {
@@ -84,6 +88,18 @@ class TaskQueueServiceTest {
         verify(repository, never()).saveAll(anyList());
     }
 
+    @Test void typeCapacitySkipsCappedTypeAndUsesOtherAvailableTypes() {
+        Task capped = task("heavy", TaskPriority.HIGH, 1);
+        Task other = task("fast", TaskPriority.HIGH, 1);
+        when(repository.findTasksForProcessing(any(), anyInt())).thenReturn(List.of(capped, other));
+        when(repository.saveAll(anyList())).thenAnswer(inv -> inv.getArgument(0));
+
+        List<Task> selected = service.dequeueTasks(1, java.util.Map.of("heavy", 0));
+
+        assertEquals(List.of(other), selected);
+        assertEquals(TaskStatus.PENDING, capped.getStatus());
+    }
+
     @Test void completeTaskUpdatesOnlyProcessingTasks() {
         Task task = task("x", TaskPriority.MEDIUM, 1);
         task.setStatus(TaskStatus.PROCESSING); task.setStartedAt(Instant.now().minusMillis(50));
@@ -114,8 +130,11 @@ class TaskQueueServiceTest {
     @Test void failTaskRetriesThenMarksExhaustedTaskFailed() {
         Task task = task("x", TaskPriority.MEDIUM, 2); task.setStatus(TaskStatus.PROCESSING); task.setAttemptCount(1);
         when(repository.findByIdForUpdate(task.getId())).thenReturn(Optional.of(task));
+        Instant beforeRetry = Instant.now();
         service.failTask(task.getId(), task.getAttemptCount(), "retry me");
-        assertEquals(TaskStatus.PENDING, task.getStatus());
+        assertEquals(TaskStatus.SCHEDULED, task.getStatus());
+        assertTrue(task.getScheduledAt().isAfter(beforeRetry));
+        assertTrue(task.getScheduledAt().isBefore(beforeRetry.plusSeconds(2)));
         assertNull(task.getWorkerId());
         assertEquals("retry me", task.getErrorMessage());
 
@@ -124,6 +143,62 @@ class TaskQueueServiceTest {
         assertEquals(TaskStatus.FAILED, task.getStatus());
         assertNotNull(task.getCompletedAt());
         verify(metrics).recordTaskFailed("x");
+    }
+
+    @Test void idempotencyKeyReturnsOriginalTaskForTheSameRequest() {
+        CreateTaskRequest request = CreateTaskRequest.builder().taskType("mail").payload("{}").build();
+        when(idempotencyRepository.reserve(eq("request-1"), anyString(), any()))
+                .thenReturn(1, 0);
+        when(repository.save(any(Task.class))).thenAnswer(inv -> inv.getArgument(0));
+        TaskResponse created = service.enqueueTask(request, "request-1");
+        ArgumentCaptor<String> hashCaptor = ArgumentCaptor.forClass(String.class);
+        verify(idempotencyRepository).reserve(eq("request-1"), hashCaptor.capture(), any());
+
+        TaskIdempotencyRecord record = new TaskIdempotencyRecord("request-1", hashCaptor.getValue(), created.getId());
+        when(idempotencyRepository.findById("request-1")).thenReturn(Optional.of(record));
+        Task persisted = Task.builder().id(created.getId()).taskType("mail").payload("{}").build();
+        when(repository.findById(created.getId())).thenReturn(Optional.of(persisted));
+
+        TaskResponse repeated = service.enqueueTask(request, "request-1");
+
+        assertEquals(created.getId(), repeated.getId());
+        verify(repository, times(1)).save(any(Task.class));
+        verify(metrics, times(1)).recordTaskEnqueued("mail");
+    }
+
+    @Test void idempotencyKeyCannotBeReusedForDifferentRequestBody() {
+        CreateTaskRequest original = CreateTaskRequest.builder().taskType("mail").payload("{}").build();
+        when(idempotencyRepository.reserve(eq("request-2"), anyString(), any())).thenReturn(1, 0);
+        when(repository.save(any(Task.class))).thenAnswer(inv -> inv.getArgument(0));
+        TaskResponse created = service.enqueueTask(original, "request-2");
+        ArgumentCaptor<String> hashCaptor = ArgumentCaptor.forClass(String.class);
+        verify(idempotencyRepository).reserve(eq("request-2"), hashCaptor.capture(), any());
+        when(idempotencyRepository.findById("request-2")).thenReturn(Optional.of(
+                new TaskIdempotencyRecord("request-2", hashCaptor.getValue(), created.getId())));
+
+        assertThrows(IdempotencyConflictException.class, () -> service.enqueueTask(
+                CreateTaskRequest.builder().taskType("mail").payload("different").build(), "request-2"));
+        verify(repository, times(1)).save(any(Task.class));
+    }
+
+    @Test void replayCreatesNewPendingTaskLinkedToFailedTask() {
+        Task failed = task("mail", TaskPriority.HIGH, 3);
+        failed.setStatus(TaskStatus.FAILED);
+        when(repository.findByIdForUpdate(failed.getId())).thenReturn(Optional.of(failed));
+        when(repository.save(any(Task.class))).thenAnswer(inv -> {
+            Task task = inv.getArgument(0);
+            task.setId(UUID.randomUUID());
+            return task;
+        });
+
+        TaskResponse replay = service.replayFailedTask(failed.getId()).orElseThrow();
+
+        ArgumentCaptor<Task> captor = ArgumentCaptor.forClass(Task.class);
+        verify(repository).save(captor.capture());
+        assertEquals(TaskStatus.PENDING, captor.getValue().getStatus());
+        assertEquals(failed.getId(), captor.getValue().getReplayOfTaskId());
+        assertEquals(TaskPriority.HIGH, replay.getPriority());
+        assertEquals(failed.getId(), replay.getReplayOfTaskId());
     }
 
     @Test void cancelOnlyPendingOrScheduledTasks() {

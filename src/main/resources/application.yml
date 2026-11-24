@@ -34,6 +34,22 @@ spring:
 
 # Task Processor Configuration
 task-processor:
+  retry:
+    initial-delay-ms: 1000
+    max-delay-ms: 60000
+    jitter-factor: 0.2
+
+  admission:
+    # Outstanding count includes PENDING, PROCESSING, and SCHEDULED tasks.
+    # Set to 0 to disable the global cap.
+    max-outstanding-tasks: 10000
+    # Optional limits keyed by taskType, for example: {REPORT: 100, EMAIL: 1000}
+    max-outstanding-by-type: {}
+
+  scheduler:
+    # How often each instance checks for due one-time and recurring tasks.
+    poll-interval-ms: 1000
+
   # Unique worker ID - auto-generated if not set
   # Set this explicitly in multi-pod deployments via environment variable
   # worker-id: ${HOSTNAME:${random.uuid}}
@@ -48,6 +64,11 @@ task-processor:
     
     # Maximum threads the pool can grow to
     max-pool-size: 20
+
+    # Optional per-instance caps. Leave empty to use the shared pool without type caps.
+    # max-concurrent-by-type:
+    #   REPORT: 2
+    #   EMAIL: 10
     
     # Number of tasks to fetch per poll
     # Higher values reduce DB calls but increase memory usage

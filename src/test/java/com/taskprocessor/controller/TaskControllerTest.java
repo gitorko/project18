@@ -24,8 +24,9 @@ class TaskControllerTest {
 
     @Test void createsAndGetsTasks() {
         TaskResponse task = TaskResponse.builder().id(UUID.randomUUID()).build();
-        when(service.enqueueTask(any())).thenReturn(task);
-        assertEquals(201, controller.createTask(CreateTaskRequest.builder().taskType("x").build()).getStatusCode().value());
+        when(service.enqueueTask(any(), eq("client-request-1"))).thenReturn(task);
+        assertEquals(201, controller.createTask(CreateTaskRequest.builder().taskType("x").build(), "client-request-1")
+                .getStatusCode().value());
         when(service.enqueueTasks(any())).thenReturn(List.of(task));
         BulkCreateTaskRequest bulk = BulkCreateTaskRequest.builder().tasks(List.of()).build();
         when(service.enqueueTasks(bulk)).thenReturn(List.of(task));
@@ -48,5 +49,14 @@ class TaskControllerTest {
         assertEquals(404, controller.cancelTask(id).getStatusCode().value());
         when(service.getProcessingTasks()).thenReturn(List.of());
         assertTrue(controller.getProcessingTasks().getBody().isEmpty());
+    }
+
+    @Test void replaysFailedTaskAndReturnsNotFoundForUnknownTask() {
+        UUID id = UUID.randomUUID();
+        TaskResponse replay = TaskResponse.builder().id(UUID.randomUUID()).build();
+        when(service.replayFailedTask(id)).thenReturn(Optional.of(replay));
+        assertEquals(201, controller.replayTask(id).getStatusCode().value());
+        when(service.replayFailedTask(any())).thenReturn(Optional.empty());
+        assertEquals(404, controller.replayTask(UUID.randomUUID()).getStatusCode().value());
     }
 }

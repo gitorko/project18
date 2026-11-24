@@ -8,5 +8,7 @@
     <include file="db/changelog/changes/001-create-tasks-table.sql" relativeToChangelogFile="false"/>
     <include file="db/changelog/changes/002-add-timeout-seconds.sql" relativeToChangelogFile="false"/>
     <include file="db/changelog/changes/003-map-numeric-priorities.sql" relativeToChangelogFile="false"/>
+    <include file="db/changelog/changes/004-recurring-schedules.sql" relativeToChangelogFile="false"/>
+    <include file="db/changelog/changes/005-retries-idempotency-admission.sql" relativeToChangelogFile="false"/>
 
 </databaseChangeLog>

@@ -25,7 +25,6 @@ import java.util.UUID;
 public class Task {
 
     @Id
-    @GeneratedValue(strategy = GenerationType.UUID)
     private UUID id;
 
     /**
@@ -116,6 +115,14 @@ public class Task {
     @Column(name = "scheduled_at")
     private Instant scheduledAt;
 
+    /** Recurring schedule that produced this occurrence, when applicable. */
+    @Column(name = "schedule_id")
+    private UUID scheduleId;
+
+    /** Previous failed task when this task was created through the replay API. */
+    @Column(name = "replay_of_task_id")
+    private UUID replayOfTaskId;
+
     /**
      * Max execution time in seconds before the task is cancelled and failed.
      * Falls back to the configured default when not set.
@@ -125,6 +132,9 @@ public class Task {
 
     @PrePersist
     protected void onCreate() {
+        if (id == null) {
+            id = UUID.randomUUID();
+        }
         createdAt = Instant.now();
         updatedAt = Instant.now();
         if (scheduledAt == null) {

@@ -30,6 +30,8 @@ public class TaskResponse {
     private Instant startedAt;
     private Instant completedAt;
     private Instant scheduledAt;
+    private UUID scheduleId;
+    private UUID replayOfTaskId;
     private String errorMessage;
     private Integer timeoutSeconds;
 
@@ -48,6 +50,8 @@ public class TaskResponse {
                 .startedAt(task.getStartedAt())
                 .completedAt(task.getCompletedAt())
                 .scheduledAt(task.getScheduledAt())
+                .scheduleId(task.getScheduleId())
+                .replayOfTaskId(task.getReplayOfTaskId())
                 .errorMessage(task.getErrorMessage())
                 .timeoutSeconds(task.getTimeoutSeconds())
                 .build();
