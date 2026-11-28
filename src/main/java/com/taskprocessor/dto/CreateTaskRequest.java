@@ -4,6 +4,7 @@ import com.taskprocessor.entity.TaskPriority;
 import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Size;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
@@ -19,6 +20,7 @@ public class CreateTaskRequest {
     @NotBlank(message = "Task type is required")
     private String taskType;
 
+    @Size(max = 65536, message = "Payload must be at most 65536 characters")
     private String payload;
 
     @Builder.Default

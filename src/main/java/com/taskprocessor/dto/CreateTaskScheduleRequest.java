@@ -21,6 +21,7 @@ public class CreateTaskScheduleRequest {
     @NotBlank(message = "Task type is required")
     private String taskType;
 
+    @jakarta.validation.constraints.Size(max = 65536, message = "Payload must be at most 65536 characters")
     private String payload;
 
     @Builder.Default

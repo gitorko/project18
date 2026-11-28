@@ -189,35 +189,43 @@ public interface TaskRepository extends JpaRepository<Task, UUID> {
     int bulkUpdateStatus(@Param("ids") List<UUID> ids, @Param("status") TaskStatus status, @Param("now") Instant now);
 
     /**
-     * Reset stale tasks back to PENDING status
+     * Reset stale tasks back to PENDING status. Rows are locked with SKIP LOCKED so recovery
+     * running on several pods does not block on, or repeat, the same rows.
      */
     @Modifying
-    @Query("""
-        UPDATE Task t 
-        SET t.status = 'PENDING', 
-            t.workerId = null, 
-            t.lastHeartbeat = null,
-            t.updatedAt = :now
-        WHERE t.status = 'PROCESSING' 
-        AND t.lastHeartbeat < :staleThreshold
-        AND t.attemptCount < t.maxAttempts
-        """)
+    @Query(value = """
+        WITH stale AS (
+            SELECT id FROM tasks
+            WHERE status = 'PROCESSING'
+            AND last_heartbeat < :staleThreshold
+            AND attempt_count < max_attempts
+            FOR UPDATE SKIP LOCKED
+        )
+        UPDATE tasks t
+        SET status = 'PENDING', worker_id = NULL, last_heartbeat = NULL, updated_at = :now
+        FROM stale s
+        WHERE t.id = s.id
+        """, nativeQuery = true)
     int resetStaleTasks(@Param("staleThreshold") Instant staleThreshold, @Param("now") Instant now);
 
     /**
      * Mark tasks as FAILED if they exceeded max attempts
      */
     @Modifying
-    @Query("""
-        UPDATE Task t 
-        SET t.status = 'FAILED', 
-            t.workerId = null,
-            t.errorMessage = 'Max retry attempts exceeded',
-            t.updatedAt = :now
-        WHERE t.status = 'PROCESSING' 
-        AND t.lastHeartbeat < :staleThreshold
-        AND t.attemptCount >= t.maxAttempts
-        """)
+    @Query(value = """
+        WITH stale AS (
+            SELECT id FROM tasks
+            WHERE status = 'PROCESSING'
+            AND last_heartbeat < :staleThreshold
+            AND attempt_count >= max_attempts
+            FOR UPDATE SKIP LOCKED
+        )
+        UPDATE tasks t
+        SET status = 'FAILED', worker_id = NULL, completed_at = :now,
+            error_message = 'Max retry attempts exceeded', updated_at = :now
+        FROM stale s
+        WHERE t.id = s.id
+        """, nativeQuery = true)
     int markExhaustedTasksAsFailed(@Param("staleThreshold") Instant staleThreshold, @Param("now") Instant now);
 
     /**

@@ -12,5 +12,6 @@
     <include file="db/changelog/changes/005-retries-idempotency-admission.sql" relativeToChangelogFile="false"/>
     <include file="db/changelog/changes/006-queue-index-tuning.sql" relativeToChangelogFile="false"/>
     <include file="db/changelog/changes/007-task-correlation-id.sql" relativeToChangelogFile="false"/>
+    <include file="db/changelog/changes/008-hot-table-tuning.sql" relativeToChangelogFile="false"/>
 
 </databaseChangeLog>

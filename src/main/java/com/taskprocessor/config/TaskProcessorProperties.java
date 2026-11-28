@@ -44,7 +44,7 @@ public class TaskProcessorProperties {
         /** Whether finished (COMPLETED, FAILED, CANCELLED) tasks are purged automatically. */
         private boolean enabled = true;
         /** Finished tasks last updated more than this many hours ago are purged; 0 purges them on the next run. */
-        private long retentionHours = 0;
+        private long retentionHours = 24;
         /** How often the purge runs, in milliseconds. */
         private long purgeIntervalMs = 300000;
         /** Maximum rows removed per transaction; the purge loops until fewer are found. */
