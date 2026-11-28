@@ -1,6 +1,7 @@
 package com.taskprocessor.service;
 
 import com.taskprocessor.config.TaskProcessorProperties;
+import com.taskprocessor.metrics.TaskMetrics;
 import com.taskprocessor.repository.TaskRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -29,6 +30,7 @@ public class TaskRetentionService {
     private final TaskRepository taskRepository;
     private final TaskProcessorProperties properties;
     private final TransactionTemplate transactionTemplate;
+    private final TaskMetrics taskMetrics;
 
     @Scheduled(fixedDelayString = "${task-processor.retention.purge-interval-ms:300000}",
             initialDelayString = "${task-processor.retention.purge-interval-ms:300000}")
@@ -49,6 +51,7 @@ public class TaskRetentionService {
                     break;
                 }
             }
+            taskMetrics.recordTasksPurged(total);
             if (total > 0) {
                 log.info("Purged {} finished tasks older than {}", total, cutoff);
             }

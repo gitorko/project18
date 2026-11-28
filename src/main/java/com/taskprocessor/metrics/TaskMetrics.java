@@ -143,6 +143,77 @@ public class TaskMetrics {
                 .increment();
     }
 
+    /** Time a task waited, runnable but unclaimed, before a worker picked it up. */
+    public void recordQueueWait(String taskType, long waitMs) {
+        Timer.builder("tasks.queue.wait.duration")
+                .description("Time between a task becoming runnable and a worker claiming it")
+                .tag("type", taskType)
+                .publishPercentiles(0.5, 0.95, 0.99)
+                .register(meterRegistry)
+                .record(java.time.Duration.ofMillis(waitMs));
+    }
+
+    /** Duration of one execution attempt by outcome: completed, retried, failed or timeout. */
+    public void recordAttempt(String taskType, String outcome, long durationMs) {
+        Timer.builder("tasks.attempt.duration")
+                .description("Handler execution time per attempt, by outcome")
+                .tag("type", taskType)
+                .tag("outcome", outcome)
+                .register(meterRegistry)
+                .record(java.time.Duration.ofMillis(Math.max(0, durationMs)));
+    }
+
+    /** An attempt failed and a retry was scheduled. */
+    public void recordTaskRetried(String taskType) {
+        Counter.builder("tasks.retried")
+                .description("Attempts that failed and were scheduled for retry")
+                .tag("type", taskType)
+                .register(meterRegistry)
+                .increment();
+    }
+
+    /** A task overran its execution timeout and was cancelled. */
+    public void recordTaskTimedOut(String taskType) {
+        Counter.builder("tasks.timeouts")
+                .description("Tasks cancelled for exceeding their execution timeout")
+                .tag("type", taskType)
+                .register(meterRegistry)
+                .increment();
+    }
+
+    /** Stale tasks found by recovery: how many were retried and how many were failed. */
+    public void recordStaleRecovery(int reset, int failed) {
+        if (reset > 0) {
+            Counter.builder("tasks.stale.reset")
+                    .description("Stale tasks returned to the queue by recovery")
+                    .register(meterRegistry).increment(reset);
+        }
+        if (failed > 0) {
+            Counter.builder("tasks.stale.failed")
+                    .description("Stale tasks failed by recovery after exhausting attempts")
+                    .register(meterRegistry).increment(failed);
+            tasksFailedCounter.increment(failed);
+        }
+    }
+
+    /** Tasks handed back to the queue by this worker (shutdown or executor rejection). */
+    public void recordTasksReleased(int count) {
+        if (count > 0) {
+            Counter.builder("tasks.released")
+                    .description("Claimed tasks returned to the queue without running to completion")
+                    .register(meterRegistry).increment(count);
+        }
+    }
+
+    /** Finished tasks removed by the retention purge. */
+    public void recordTasksPurged(long count) {
+        if (count > 0) {
+            Counter.builder("tasks.purged")
+                    .description("Finished tasks deleted by the retention purge")
+                    .register(meterRegistry).increment(count);
+        }
+    }
+
     /**
      * Record tasks being polled
      */

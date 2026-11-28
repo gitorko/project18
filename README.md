@@ -8,6 +8,7 @@ A distributed task queue implementation using Spring Boot and PostgreSQL. Simila
 - **Configurable Thread Pool**: Dynamically adjust processing capacity at runtime
 - **Adaptive Polling**: Reduces DB load when queue is empty, and polls early when a finished task frees a worker slot
 - **Heartbeat Mechanism**: Batched heartbeats detect and recover stuck tasks from crashed workers; tasks still running at shutdown are released straight back to the queue
+- **Observability**: Queue-wait, per-attempt duration (by outcome), retry, timeout, stale-recovery, release and purge metrics, plus a correlation id that follows a task from the enqueuing request into its execution logs
 - **Retention**: Finished (completed, failed, cancelled) tasks are purged automatically after a configurable window
 - **Retry Support**: Exponential retry delay with jitter and manual replay of failed tasks
 - **Priority Queue**: Higher priority tasks are processed first
@@ -369,10 +370,28 @@ GET /actuator/prometheus
 Key metrics:
 - `tasks.enqueued` - Total tasks enqueued
 - `tasks.completed` - Total tasks completed
-- `tasks.failed` - Total tasks failed
+- `tasks.failed` - Total tasks failed (including tasks failed by stale recovery)
 - `tasks.processing.active` - Currently processing tasks
 - `tasks.processing.duration` - Processing time histogram
 - `tasks.processing.rate` - Tasks per minute
+- `tasks.queue.wait.duration{type}` - Time between a task becoming runnable and a worker claiming it (p50/p95/p99); the best signal that workers are falling behind
+- `tasks.attempt.duration{type,outcome}` - Handler time per attempt; `outcome` is `completed`, `retried`, `failed` or `timeout`
+- `tasks.retried{type}` - Attempts that failed and were scheduled for retry
+- `tasks.timeouts{type}` - Tasks cancelled for exceeding their timeout
+- `tasks.stale.reset` / `tasks.stale.failed` - Tasks recovered or failed by stale-task recovery
+- `tasks.released` - Claimed tasks returned to the queue (shutdown, executor rejection)
+- `tasks.purged` - Finished tasks deleted by the retention purge
+
+#### Tracing a task with a correlation id
+
+Every request gets a correlation id: the caller's `X-Correlation-Id` header when
+it is present and well formed (letters, digits, `.`, `_`, `:`, `-`, up to 100
+characters), otherwise a generated one. It is echoed in the response header,
+stored on any task the request creates (`correlationId` in the task response),
+and put in the logging context while the task runs, together with `taskId`,
+`taskType` and `attempt`. The default log pattern prints
+`[correlationId] [taskId]`, so a task's execution logs can be tied back to the
+request that enqueued it.
 
 ## Configuration
 
@@ -502,6 +521,7 @@ broker is required.
 | `TaskProcessorService` | Resolve a `TaskHandler`, execute it, and report success or failure. |
 | `ScheduledTaskService` | Promote due tasks and materialize recurring occurrences. |
 | `StaleTaskRecoveryService` | Reset stale in-flight work or mark exhausted tasks as failed. |
+| `CorrelationIdFilter` | Assign or accept a correlation id per request and expose it to logs and new tasks. |
 | `TaskRetentionService` | Purge finished tasks (`COMPLETED`, `FAILED`, `CANCELLED`) older than the retention window. |
 | `TaskRepository` | JPA and PostgreSQL-specific queue operations, including `FOR UPDATE SKIP LOCKED`. |
 | `TaskMetrics` | Micrometer counters, timers, gauges, and process-local runtime/rate samples. |
@@ -572,9 +592,17 @@ FOR UPDATE SKIP LOCKED
 ```
 
 `SKIP LOCKED` lets concurrent workers claim different rows without a separate
-leader or distributed lock. The lock is held only while the transaction marks
-selected rows `PROCESSING`, stores the worker ID and timestamps, and increments
-`attemptCount`; it is released before handlers run.
+leader or distributed lock. The candidate query reads only `id`, `task_type` and
+`priority`, so payloads of rows that are not claimed are never loaded. After fair
+selection, the chosen rows are claimed with one
+`UPDATE ... SET status = 'PROCESSING' ... RETURNING *`, which stores the worker
+ID and timestamps, increments `attemptCount` and returns the full rows. The lock
+is held only for that transaction and released before handlers run.
+
+Completion and failure are single guarded `UPDATE` statements
+(`WHERE status = 'PROCESSING' AND attempt_count = :attempt`), so there is no
+lock-read-save round trip and a late result from an older attempt changes
+nothing.
 
 Task types that have reached their `max-concurrent-by-type` cap on this worker
 are excluded in SQL (`task_type NOT IN (...)`), so a saturated type cannot fill

@@ -69,37 +69,76 @@ class TaskQueueServiceTest {
         assertEquals(TaskStatus.PENDING, immediate.getStatus());
     }
 
-    @Test void dequeueMarksSelectedRowsAndRoundRobinsWithinPriority() {
+    /** Candidate row as returned by the narrow candidate query (no payload, no other columns). */
+    private static TaskRepository.CandidateRow row(Task task) {
+        return new TaskRepository.CandidateRow() {
+            @Override public UUID getId() { return task.getId(); }
+            @Override public String getTaskType() { return task.getTaskType(); }
+            @Override public Integer getPriority() { return task.getPriority().getDatabaseValue(); }
+        };
+    }
+
+    private static List<TaskRepository.CandidateRow> rows(Task... tasks) {
+        return java.util.Arrays.stream(tasks).map(TaskQueueServiceTest::row).toList();
+    }
+
+    /** Simulates the claim statement: returns the requested rows, in arbitrary (reversed) order. */
+    private void stubClaimFor(Task... all) {
+        when(repository.claimTasks(anyCollection(), eq("worker-1"), any())).thenAnswer(inv -> {
+            java.util.Collection<UUID> ids = inv.getArgument(1 - 1);
+            List<Task> claimed = new java.util.ArrayList<>();
+            for (Task t : all) {
+                if (ids.contains(t.getId())) {
+                    t.setStatus(TaskStatus.PROCESSING);
+                    t.setWorkerId("worker-1");
+                    t.setAttemptCount(t.getAttemptCount() + 1);
+                    t.setScheduledAt(Instant.now().minusMillis(40));
+                    t.setStartedAt(Instant.now());
+                    claimed.add(t);
+                }
+            }
+            java.util.Collections.reverse(claimed);
+            return claimed;
+        });
+    }
+
+    @Test void dequeueClaimsOnlySelectedRowsAndRoundRobinsWithinPriority() {
         Task a1 = task("a", TaskPriority.MEDIUM, 10), a2 = task("a", TaskPriority.MEDIUM, 10),
                 b1 = task("b", TaskPriority.MEDIUM, 10), low = task("low", TaskPriority.LOW, 10);
-        when(repository.findTasksForProcessing(any(), anyInt())).thenReturn(List.of(a1, a2, b1, low));
-        when(repository.saveAll(anyList())).thenAnswer(inv -> inv.getArgument(0));
+        when(repository.findCandidates(any(), anyInt())).thenReturn(rows(a1, a2, b1, low));
+        stubClaimFor(a1, a2, b1, low);
+
         List<Task> result = service.dequeueTasks(3);
-        assertEquals(List.of(a1, b1, a2), result);
+
+        assertEquals(List.of(a1, b1, a2), result, "result keeps the fair selection order");
         assertTrue(result.stream().allMatch(t -> t.getStatus() == TaskStatus.PROCESSING));
-        assertTrue(result.stream().allMatch(t -> "worker-1".equals(t.getWorkerId())));
-        assertTrue(result.stream().allMatch(t -> t.getAttemptCount() == 1));
-        verify(repository).findTasksForProcessing(any(), eq(15));
+        assertEquals(TaskStatus.PENDING, low.getStatus());
+        verify(repository).findCandidates(any(), eq(15));
+        ArgumentCaptor<java.util.Collection<UUID>> claimed = ArgumentCaptor.forClass(java.util.Collection.class);
+        verify(repository).claimTasks(claimed.capture(), eq("worker-1"), any());
+        assertEquals(List.of(a1.getId(), b1.getId(), a2.getId()), List.copyOf(claimed.getValue()));
+        verify(repository, never()).saveAll(anyList());
+        verify(metrics, times(3)).recordQueueWait(anyString(), longThat(wait -> wait >= 0));
     }
 
     @Test void dequeueReturnsEmptyWhenNoCandidates() {
-        when(repository.findTasksForProcessing(any(), anyInt())).thenReturn(List.of());
+        when(repository.findCandidates(any(), anyInt())).thenReturn(List.of());
         assertTrue(service.dequeueTasks(4).isEmpty());
-        verify(repository, never()).saveAll(anyList());
+        verify(repository, never()).claimTasks(any(), any(), any());
     }
 
     @Test void typeCapacitySkipsCappedTypeAndUsesOtherAvailableTypes() {
         Task capped = task("heavy", TaskPriority.HIGH, 1);
         Task other = task("fast", TaskPriority.HIGH, 1);
-        when(repository.findTasksForProcessingExcludingTypes(any(), anyInt(), eq(java.util.Set.of("heavy"))))
-                .thenReturn(List.of(other));
-        when(repository.saveAll(anyList())).thenAnswer(inv -> inv.getArgument(0));
+        when(repository.findCandidatesExcludingTypes(any(), anyInt(), eq(java.util.Set.of("heavy"))))
+                .thenReturn(rows(other));
+        stubClaimFor(capped, other);
 
         List<Task> selected = service.dequeueTasks(1, java.util.Map.of("heavy", 0));
 
         assertEquals(List.of(other), selected);
         assertEquals(TaskStatus.PENDING, capped.getStatus());
-        verify(repository, never()).findTasksForProcessing(any(), anyInt());
+        verify(repository, never()).findCandidates(any(), anyInt());
     }
 
     @Test void saturatedTypeCannotCrowdOutOtherTypesFromTheCandidatePool() {
@@ -107,10 +146,13 @@ class TaskQueueServiceTest {
         List<Task> heavy = java.util.stream.IntStream.range(0, 15)
                 .mapToObj(i -> task("heavy", TaskPriority.HIGH, 1)).toList();
         Task fast1 = task("fast", TaskPriority.MEDIUM, 1), fast2 = task("fast", TaskPriority.MEDIUM, 1);
-        when(repository.findTasksForProcessing(any(), anyInt())).thenReturn(heavy);
-        when(repository.findTasksForProcessingExcludingTypes(any(), anyInt(), eq(java.util.Set.of("heavy"))))
-                .thenReturn(List.of(fast1, fast2));
-        when(repository.saveAll(anyList())).thenAnswer(inv -> inv.getArgument(0));
+        when(repository.findCandidates(any(), anyInt())).thenReturn(heavy.stream().map(TaskQueueServiceTest::row).toList());
+        when(repository.findCandidatesExcludingTypes(any(), anyInt(), eq(java.util.Set.of("heavy"))))
+                .thenReturn(rows(fast1, fast2));
+        List<Task> all = new java.util.ArrayList<>(heavy);
+        all.add(fast1);
+        all.add(fast2);
+        stubClaimFor(all.toArray(new Task[0]));
 
         List<Task> selected = service.dequeueTasks(3, java.util.Map.of("heavy", 1));
 
@@ -121,10 +163,12 @@ class TaskQueueServiceTest {
         List<Task> heavy = java.util.stream.IntStream.range(0, 15)
                 .mapToObj(i -> task("heavy", TaskPriority.HIGH, 1)).toList();
         Task fast = task("fast", TaskPriority.MEDIUM, 1);
-        when(repository.findTasksForProcessing(any(), anyInt())).thenReturn(heavy);
-        when(repository.findTasksForProcessingExcludingTypes(any(), anyInt(), any()))
-                .thenReturn(List.of(heavy.get(0), fast));
-        when(repository.saveAll(anyList())).thenAnswer(inv -> inv.getArgument(0));
+        when(repository.findCandidates(any(), anyInt())).thenReturn(heavy.stream().map(TaskQueueServiceTest::row).toList());
+        when(repository.findCandidatesExcludingTypes(any(), anyInt(), any()))
+                .thenReturn(rows(heavy.get(0), fast));
+        List<Task> all = new java.util.ArrayList<>(heavy);
+        all.add(fast);
+        stubClaimFor(all.toArray(new Task[0]));
 
         List<Task> selected = service.dequeueTasks(3, java.util.Map.of("heavy", 1));
 
@@ -147,49 +191,67 @@ class TaskQueueServiceTest {
         assertEquals(0, service.releaseTasks(List.of()));
     }
 
-    @Test void completeTaskUpdatesOnlyProcessingTasks() {
+    @Test void completeTaskIsOneGuardedUpdateAndRecordsMetricsOnlyWhenItApplies() {
         Task task = task("x", TaskPriority.MEDIUM, 1);
-        task.setStatus(TaskStatus.PROCESSING); task.setStartedAt(Instant.now().minusMillis(50));
-        when(repository.findByIdForUpdate(task.getId())).thenReturn(Optional.of(task));
-        service.completeTask(task.getId(), task.getAttemptCount());
-        assertEquals(TaskStatus.COMPLETED, task.getStatus());
-        assertNotNull(task.getCompletedAt());
-        verify(repository).save(task);
-        verify(metrics).recordTaskCompleted(eq("x"), longThat(duration -> duration >= 0));
+        task.setStatus(TaskStatus.PROCESSING); task.setAttemptCount(1);
+        task.setStartedAt(Instant.now().minusMillis(50));
+        when(repository.markCompleted(eq(task.getId()), eq(1), any())).thenReturn(1);
+        service.completeTask(task);
+        verify(repository).markCompleted(eq(task.getId()), eq(1), any());
+        verify(repository, never()).findByIdForUpdate(any());
+        verify(repository, never()).save(any());
+        verify(metrics).recordTaskCompleted(eq("x"), longThat(duration -> duration >= 50));
 
-        task.setStatus(TaskStatus.FAILED);
+        // The guard rejected the update (task no longer PROCESSING for this attempt).
         clearInvocations(repository, metrics);
-        service.completeTask(task.getId(), task.getAttemptCount());
-        verify(repository, never()).save(any());
+        when(repository.markCompleted(any(), anyInt(), any())).thenReturn(0);
+        service.completeTask(task);
         verifyNoInteractions(metrics);
     }
 
-    @Test void staleAttemptCannotCompleteNewerRetry() {
-        Task currentAttempt = task("x", TaskPriority.MEDIUM, 3);
-        currentAttempt.setStatus(TaskStatus.PROCESSING);
-        currentAttempt.setAttemptCount(2);
-        when(repository.findByIdForUpdate(currentAttempt.getId())).thenReturn(Optional.of(currentAttempt));
-        service.completeTask(currentAttempt.getId(), 1);
-        verify(repository, never()).save(any());
-        verifyNoInteractions(metrics);
-    }
-
-    @Test void failTaskRetriesThenMarksExhaustedTaskFailed() {
+    @Test void failTaskSchedulesRetryWithBackoffWhileAttemptsRemain() {
         Task task = task("x", TaskPriority.MEDIUM, 2); task.setStatus(TaskStatus.PROCESSING); task.setAttemptCount(1);
-        when(repository.findByIdForUpdate(task.getId())).thenReturn(Optional.of(task));
+        when(repository.scheduleRetry(eq(task.getId()), eq(1), any(), eq("retry me"), any())).thenReturn(1);
         Instant beforeRetry = Instant.now();
-        service.failTask(task.getId(), task.getAttemptCount(), "retry me");
-        assertEquals(TaskStatus.SCHEDULED, task.getStatus());
-        assertTrue(task.getScheduledAt().isAfter(beforeRetry));
-        assertTrue(task.getScheduledAt().isBefore(beforeRetry.plusSeconds(2)));
-        assertNull(task.getWorkerId());
-        assertEquals("retry me", task.getErrorMessage());
 
-        task.setStatus(TaskStatus.PROCESSING); task.setAttemptCount(2);
-        service.failTask(task.getId(), task.getAttemptCount(), "terminal");
-        assertEquals(TaskStatus.FAILED, task.getStatus());
-        assertNotNull(task.getCompletedAt());
+        service.failTask(task, "retry me");
+
+        ArgumentCaptor<Instant> retryAt = ArgumentCaptor.forClass(Instant.class);
+        verify(repository).scheduleRetry(eq(task.getId()), eq(1), retryAt.capture(), eq("retry me"), any());
+        assertTrue(retryAt.getValue().isAfter(beforeRetry));
+        assertTrue(retryAt.getValue().isBefore(beforeRetry.plusSeconds(2)));
+        verify(repository, never()).markFailed(any(), anyInt(), any(), any());
+        verify(metrics).recordTaskRetried("x");
+        verify(metrics, never()).recordTaskFailed(any());
+    }
+
+    @Test void failTaskMarksExhaustedTaskFailed() {
+        Task task = task("x", TaskPriority.MEDIUM, 2); task.setStatus(TaskStatus.PROCESSING); task.setAttemptCount(2);
+        when(repository.markFailed(eq(task.getId()), eq(2), eq("terminal"), any())).thenReturn(1);
+
+        service.failTask(task, "terminal");
+
+        verify(repository).markFailed(eq(task.getId()), eq(2), eq("terminal"), any());
+        verify(repository, never()).scheduleRetry(any(), anyInt(), any(), any(), any());
         verify(metrics).recordTaskFailed("x");
+    }
+
+    @Test void failTaskIgnoresStaleAttemptsRejectedByTheGuard() {
+        Task task = task("x", TaskPriority.MEDIUM, 1); task.setAttemptCount(1);
+        when(repository.markFailed(any(), anyInt(), any(), any())).thenReturn(0);
+        service.failTask(task, "late");
+        verifyNoInteractions(metrics);
+    }
+
+    @Test void enqueuedTasksCarryTheRequestCorrelationId() {
+        org.slf4j.MDC.put(com.taskprocessor.web.CorrelationIdFilter.MDC_KEY, "req-42");
+        try {
+            when(repository.save(any(Task.class))).thenAnswer(inv -> inv.getArgument(0));
+            TaskResponse response = service.enqueueTask(CreateTaskRequest.builder().taskType("mail").build());
+            assertEquals("req-42", response.getCorrelationId());
+        } finally {
+            org.slf4j.MDC.clear();
+        }
     }
 
     @Test void idempotencyKeyReturnsOriginalTaskForTheSameRequest() {

@@ -26,34 +26,46 @@ public interface TaskRepository extends JpaRepository<Task, UUID> {
     @Query("SELECT t FROM Task t WHERE t.id = :taskId")
     Optional<Task> findByIdForUpdate(@Param("taskId") UUID taskId);
 
+    /** Lightweight view of a runnable task used to pick a batch without loading payloads. */
+    interface CandidateRow {
+        UUID getId();
+
+        String getTaskType();
+
+        /** Numeric priority rank as stored in the database. */
+        Integer getPriority();
+    }
+
     /**
-     * Fetch candidate tasks for processing using SKIP LOCKED to prevent multiple workers
+     * Pick candidate tasks for processing using SKIP LOCKED to prevent multiple workers
      * from picking the same task. This is the key to distributed queue behavior.
      *
-     * SKIP LOCKED skips rows that are already locked by other transactions,
-     * ensuring no two workers process the same task.
+     * Only the columns needed for fair selection are read (no payload or other columns),
+     * because the pool is deliberately larger than the batch and most rows are not claimed.
+     * The rows stay locked until the surrounding transaction ends, so the selected ones can
+     * then be claimed with {@link #claimTasks} without another worker interfering.
      *
      * The result is an over-fetched candidate pool (larger than the actual batch size)
      * so that TaskQueueService can apply fair round-robin selection by task type within
      * each priority tier, rather than the raw FIFO order returned here.
      */
     @Query(value = """
-        SELECT * FROM tasks
+        SELECT id AS id, task_type AS taskType, priority AS priority FROM tasks
         WHERE status = 'PENDING'
         AND scheduled_at <= :now
         ORDER BY priority DESC, created_at ASC
         LIMIT :candidatePoolSize
         FOR UPDATE SKIP LOCKED
         """, nativeQuery = true)
-    List<Task> findTasksForProcessing(@Param("now") Instant now, @Param("candidatePoolSize") int candidatePoolSize);
+    List<CandidateRow> findCandidates(@Param("now") Instant now, @Param("candidatePoolSize") int candidatePoolSize);
 
     /**
-     * Same as {@link #findTasksForProcessing} but skips task types that have no remaining
+     * Same as {@link #findCandidates} but skips task types that have no remaining
      * capacity on this worker, so a saturated type cannot fill the whole candidate pool
      * and starve runnable work of other types. {@code excludedTypes} must not be empty.
      */
     @Query(value = """
-        SELECT * FROM tasks
+        SELECT id AS id, task_type AS taskType, priority AS priority FROM tasks
         WHERE status = 'PENDING'
         AND scheduled_at <= :now
         AND task_type NOT IN (:excludedTypes)
@@ -61,9 +73,60 @@ public interface TaskRepository extends JpaRepository<Task, UUID> {
         LIMIT :candidatePoolSize
         FOR UPDATE SKIP LOCKED
         """, nativeQuery = true)
-    List<Task> findTasksForProcessingExcludingTypes(@Param("now") Instant now,
+    List<CandidateRow> findCandidatesExcludingTypes(@Param("now") Instant now,
                                                     @Param("candidatePoolSize") int candidatePoolSize,
                                                     @Param("excludedTypes") Collection<String> excludedTypes);
+
+    /**
+     * Claim the selected tasks for this worker in one statement and return the claimed rows
+     * (including payloads), so only tasks that will actually run are ever loaded in full.
+     */
+    @Query(value = """
+        UPDATE tasks
+        SET status = 'PROCESSING',
+            worker_id = :workerId,
+            started_at = :now,
+            last_heartbeat = :now,
+            attempt_count = attempt_count + 1,
+            updated_at = :now
+        WHERE id IN (:ids) AND status = 'PENDING'
+        RETURNING *
+        """, nativeQuery = true)
+    List<Task> claimTasks(@Param("ids") Collection<UUID> ids, @Param("workerId") String workerId,
+                          @Param("now") Instant now);
+
+    /**
+     * Finalization updates. Each is guarded on the task still being PROCESSING for the given
+     * attempt, so a late result from an older attempt (or one racing the timeout watchdog)
+     * cannot overwrite newer state. They return the number of rows changed (0 or 1).
+     */
+    @Modifying
+    @Query("""
+        UPDATE Task t
+        SET t.status = 'COMPLETED', t.completedAt = :now, t.workerId = null, t.updatedAt = :now
+        WHERE t.id = :taskId AND t.status = 'PROCESSING' AND t.attemptCount = :attempt
+        """)
+    int markCompleted(@Param("taskId") UUID taskId, @Param("attempt") int attempt, @Param("now") Instant now);
+
+    @Modifying
+    @Query("""
+        UPDATE Task t
+        SET t.status = 'SCHEDULED', t.scheduledAt = :retryAt, t.workerId = null, t.lastHeartbeat = null,
+            t.errorMessage = :error, t.updatedAt = :now
+        WHERE t.id = :taskId AND t.status = 'PROCESSING' AND t.attemptCount = :attempt
+        """)
+    int scheduleRetry(@Param("taskId") UUID taskId, @Param("attempt") int attempt,
+                      @Param("retryAt") Instant retryAt, @Param("error") String error, @Param("now") Instant now);
+
+    @Modifying
+    @Query("""
+        UPDATE Task t
+        SET t.status = 'FAILED', t.completedAt = :now, t.workerId = null,
+            t.errorMessage = :error, t.updatedAt = :now
+        WHERE t.id = :taskId AND t.status = 'PROCESSING' AND t.attemptCount = :attempt
+        """)
+    int markFailed(@Param("taskId") UUID taskId, @Param("attempt") int attempt,
+                   @Param("error") String error, @Param("now") Instant now);
 
     /** Promote due scheduled tasks and delayed retries, distributing rows safely across workers. */
     @Modifying

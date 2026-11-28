@@ -5,6 +5,8 @@ import com.taskprocessor.metrics.TaskMetrics;
 import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import com.taskprocessor.web.CorrelationIdFilter;
+import org.slf4j.MDC;
 import org.springframework.stereotype.Service;
 
 import java.util.HashMap;
@@ -45,7 +47,15 @@ public class TaskProcessorService {
      */
     public void processTask(Task task) {
         long startTime = System.currentTimeMillis();
-        
+        // Logging context so every log line from the handler carries the task and the
+        // correlation id of the request that created it.
+        MDC.put("taskId", task.getId().toString());
+        MDC.put("taskType", task.getTaskType());
+        MDC.put("attempt", String.valueOf(task.getAttemptCount()));
+        if (task.getCorrelationId() != null) {
+            MDC.put(CorrelationIdFilter.MDC_KEY, task.getCorrelationId());
+        }
+
         try {
             taskMetrics.incrementActiveProcessing();
             
@@ -62,19 +72,26 @@ public class TaskProcessorService {
             handler.handle(task);
             
             // Mark as completed
-            taskQueueService.completeTask(task.getId(), task.getAttemptCount());
+            taskQueueService.completeTask(task);
             
             long duration = System.currentTimeMillis() - startTime;
+            taskMetrics.recordAttempt(task.getTaskType(), "completed", duration);
             log.debug("Task {} completed in {}ms", task.getId(), duration);
             
         } catch (Exception e) {
             long duration = System.currentTimeMillis() - startTime;
             log.error("Task {} failed after {}ms: {}", task.getId(), duration, e.getMessage(), e);
             
-            taskQueueService.failTask(task.getId(), task.getAttemptCount(), e.getMessage());
+            boolean willRetry = task.getAttemptCount() < (task.getMaxAttempts() == null ? 1 : task.getMaxAttempts());
+            taskMetrics.recordAttempt(task.getTaskType(), willRetry ? "retried" : "failed", duration);
+            taskQueueService.failTask(task, e.getMessage());
             
         } finally {
             taskMetrics.decrementActiveProcessing();
+            MDC.remove("taskId");
+            MDC.remove("taskType");
+            MDC.remove("attempt");
+            MDC.remove(CorrelationIdFilter.MDC_KEY);
         }
     }
 

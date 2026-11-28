@@ -41,4 +41,37 @@ class TaskMetricsTest {
             registry.close();
         }
     }
+
+    @Test void recordsQueueWaitAttemptOutcomesAndLifecycleCounters() {
+        SimpleMeterRegistry registry = new SimpleMeterRegistry();
+        ThreadPoolExecutor executor = new ThreadPoolExecutor(1, 1, 1, TimeUnit.SECONDS, new LinkedBlockingQueue<>());
+        try {
+            TaskMetrics metrics = new TaskMetrics(registry, executor);
+            metrics.init();
+            metrics.recordQueueWait("email", 250);
+            metrics.recordAttempt("email", "completed", 40);
+            metrics.recordAttempt("email", "retried", 10);
+            metrics.recordTaskRetried("email");
+            metrics.recordTaskTimedOut("report");
+            metrics.recordStaleRecovery(2, 1);
+            metrics.recordTasksReleased(3);
+            metrics.recordTasksReleased(0);
+            metrics.recordTasksPurged(5);
+
+            assertEquals(250, registry.get("tasks.queue.wait.duration").tag("type", "email").timer()
+                    .totalTime(TimeUnit.MILLISECONDS), 0.001);
+            assertEquals(1, registry.get("tasks.attempt.duration").tag("outcome", "completed").timer().count());
+            assertEquals(1, registry.get("tasks.attempt.duration").tag("outcome", "retried").timer().count());
+            assertEquals(1, registry.get("tasks.retried").tag("type", "email").counter().count());
+            assertEquals(1, registry.get("tasks.timeouts").tag("type", "report").counter().count());
+            assertEquals(2, registry.get("tasks.stale.reset").counter().count());
+            assertEquals(1, registry.get("tasks.stale.failed").counter().count());
+            assertEquals(1, registry.get("tasks.failed").counter().count(), "stale failures count as failed tasks");
+            assertEquals(3, registry.get("tasks.released").counter().count());
+            assertEquals(5, registry.get("tasks.purged").counter().count());
+        } finally {
+            executor.shutdownNow();
+            registry.close();
+        }
+    }
 }

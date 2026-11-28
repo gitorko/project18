@@ -18,13 +18,14 @@ class TaskRetentionServiceTest {
     private final TaskRepository repository = mock(TaskRepository.class);
     private final TaskProcessorProperties properties = new TaskProcessorProperties();
     private final TransactionTemplate tx = mock(TransactionTemplate.class);
+    private final com.taskprocessor.metrics.TaskMetrics metrics = mock(com.taskprocessor.metrics.TaskMetrics.class);
     private TaskRetentionService service;
 
     @BeforeEach void setUp() {
         when(tx.execute(any())).thenAnswer(inv ->
                 inv.<org.springframework.transaction.support.TransactionCallback<?>>getArgument(0).doInTransaction(null));
         properties.getRetention().setBatchSize(2);
-        service = new TaskRetentionService(repository, properties, tx);
+        service = new TaskRetentionService(repository, properties, tx, metrics);
     }
 
     @Test void purgesFinishedTasksInBatchesUntilAShortBatchRemovingReferencesFirst() {
@@ -42,6 +43,7 @@ class TaskRetentionServiceTest {
         order.verify(repository).deleteTasksByIds(full);
         order.verify(repository).deleteTasksByIds(partial);
         verify(repository, times(2)).findPurgeableTaskIds(any(), eq(2));
+        verify(metrics).recordTasksPurged(3);
     }
 
     @Test void usesConfiguredRetentionWindow() {

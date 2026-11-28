@@ -34,6 +34,7 @@ public class TaskResponse {
     private UUID replayOfTaskId;
     private String errorMessage;
     private Integer timeoutSeconds;
+    private String correlationId;
 
     public static TaskResponse fromEntity(Task task) {
         return TaskResponse.builder()
@@ -54,6 +55,7 @@ public class TaskResponse {
                 .replayOfTaskId(task.getReplayOfTaskId())
                 .errorMessage(task.getErrorMessage())
                 .timeoutSeconds(task.getTimeoutSeconds())
+                .correlationId(task.getCorrelationId())
                 .build();
     }
 }

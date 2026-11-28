@@ -119,7 +119,7 @@ class TaskPollerServiceTest {
 
         startPoller(1);
 
-        verify(queue, timeout(2000)).failTask(eq(overdue.getId()), eq(1), contains("exceeded timeout"));
+        verify(queue, timeout(2000)).failTask(eq(overdue), contains("exceeded timeout"));
         assertTrue(started.await(2, TimeUnit.SECONDS));
         long deadline = System.currentTimeMillis() + 2000;
         while (!interrupted.get() && System.currentTimeMillis() < deadline) {
@@ -199,5 +199,38 @@ class TaskPollerServiceTest {
         } finally {
             release.countDown();
         }
+    }
+
+    @Test void interruptedHandlersDoNotFailTasksThatShutdownReleased() throws Exception {
+        properties.getPoller().setShutdownTimeoutSeconds(1);
+        Task running = runningTask(600, Instant.now());
+        when(queue.dequeueTasks(anyInt(), anyMap())).thenReturn(List.of(running)).thenReturn(List.of());
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch interrupted = new CountDownLatch(1);
+        // Behaves like TaskProcessorService: an interrupted handler reports the task as failed.
+        doAnswer(inv -> {
+            started.countDown();
+            try {
+                new CountDownLatch(1).await();
+            } catch (InterruptedException e) {
+                interrupted.countDown();
+                queue.failTask(running, "interrupted");
+            }
+            return null;
+        }).when(processor).processTask(any());
+        // Release must happen before the interrupt is delivered.
+        when(queue.releaseTasks(any())).thenAnswer(inv -> {
+            assertEquals(1, interrupted.getCount(), "tasks must be released before handlers are interrupted");
+            return 1;
+        });
+
+        startPoller(1);
+        assertTrue(started.await(2, TimeUnit.SECONDS));
+        poller.shutdown();
+
+        assertTrue(interrupted.await(2, TimeUnit.SECONDS));
+        var order = inOrder(queue);
+        order.verify(queue).releaseTasks(List.of(running.getId()));
+        order.verify(queue).failTask(eq(running), any());
     }
 }

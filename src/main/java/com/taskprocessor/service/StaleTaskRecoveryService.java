@@ -1,6 +1,7 @@
 package com.taskprocessor.service;
 
 import com.taskprocessor.config.TaskProcessorProperties;
+import com.taskprocessor.metrics.TaskMetrics;
 import com.taskprocessor.repository.TaskRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -29,6 +30,7 @@ public class StaleTaskRecoveryService {
 
     private final TaskRepository taskRepository;
     private final TaskProcessorProperties properties;
+    private final TaskMetrics taskMetrics;
 
     /**
      * Periodically check for and recover stale tasks.
@@ -42,17 +44,20 @@ public class StaleTaskRecoveryService {
                     .minusMillis(properties.getHeartbeat().getStaleThresholdMs());
             Instant now = Instant.now();
 
+            int resetCount = 0;
+            int failedCount = 0;
             // First, reset tasks that can be retried
-            int resetCount = taskRepository.resetStaleTasks(staleThreshold, now);
+            resetCount = taskRepository.resetStaleTasks(staleThreshold, now);
             if (resetCount > 0) {
                 log.info("Reset {} stale tasks for retry", resetCount);
             }
 
             // Then, mark exhausted tasks as failed
-            int failedCount = taskRepository.markExhaustedTasksAsFailed(staleThreshold, now);
+            failedCount = taskRepository.markExhaustedTasksAsFailed(staleThreshold, now);
             if (failedCount > 0) {
                 log.warn("Marked {} tasks as failed (max retries exceeded)", failedCount);
             }
+            taskMetrics.recordStaleRecovery(resetCount, failedCount);
 
         } catch (Exception e) {
             log.error("Error during stale task recovery: {}", e.getMessage(), e);

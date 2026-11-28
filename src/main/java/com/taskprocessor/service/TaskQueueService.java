@@ -5,6 +5,8 @@ import com.taskprocessor.dto.*;
 import com.taskprocessor.entity.Task;
 import com.taskprocessor.entity.TaskPriority;
 import com.taskprocessor.entity.TaskStatus;
+import com.taskprocessor.web.CorrelationIdFilter;
+import org.slf4j.MDC;
 import com.taskprocessor.metrics.TaskMetrics;
 import com.taskprocessor.repository.TaskRepository;
 import com.taskprocessor.repository.TaskIdempotencyRepository;
@@ -64,6 +66,7 @@ public class TaskQueueService {
                 .timeoutSeconds(request.getTimeoutSeconds() != null
                         ? request.getTimeoutSeconds()
                         : properties.getPoller().getDefaultTaskTimeoutSeconds())
+                .correlationId(MDC.get(CorrelationIdFilter.MDC_KEY))
                 .status(request.getScheduledAt() != null && request.getScheduledAt().isAfter(Instant.now())
                         ? TaskStatus.SCHEDULED : TaskStatus.PENDING)
                 .scheduledAt(request.getScheduledAt())
@@ -112,6 +115,7 @@ public class TaskQueueService {
                         .timeoutSeconds(req.getTimeoutSeconds() != null
                                 ? req.getTimeoutSeconds()
                                 : properties.getPoller().getDefaultTaskTimeoutSeconds())
+                        .correlationId(MDC.get(CorrelationIdFilter.MDC_KEY))
                         .status(req.getScheduledAt() != null && req.getScheduledAt().isAfter(Instant.now())
                                 ? TaskStatus.SCHEDULED : TaskStatus.PENDING)
                         .scheduledAt(req.getScheduledAt())
@@ -160,29 +164,30 @@ public class TaskQueueService {
             }
         });
 
-        List<Task> selected = new ArrayList<>();
+        List<Candidate> selected = new ArrayList<>();
         Set<UUID> seen = new HashSet<>();
         int totalCandidates = 0;
 
         for (int pass = 0; pass <= MAX_CANDIDATE_REFETCHES; pass++) {
-            List<Task> candidates = excludedTypes.isEmpty()
-                    ? taskRepository.findTasksForProcessing(Instant.now(), candidatePoolSize)
-                    : taskRepository.findTasksForProcessingExcludingTypes(
+            List<TaskRepository.CandidateRow> rows = excludedTypes.isEmpty()
+                    ? taskRepository.findCandidates(Instant.now(), candidatePoolSize)
+                    : taskRepository.findCandidatesExcludingTypes(
                             Instant.now(), candidatePoolSize, excludedTypes);
-            totalCandidates += candidates.size();
+            totalCandidates += rows.size();
 
             // Rows locked by this transaction are returned again on a refetch; skip them.
-            List<Task> fresh = new ArrayList<>(candidates.size());
-            for (Task candidate : candidates) {
-                if (seen.add(candidate.getId())) {
-                    fresh.add(candidate);
+            List<Candidate> fresh = new ArrayList<>(rows.size());
+            for (TaskRepository.CandidateRow row : rows) {
+                if (seen.add(row.getId())) {
+                    fresh.add(new Candidate(row.getId(), row.getTaskType(),
+                            TaskPriority.fromDatabaseValue(row.getPriority())));
                 }
             }
 
             selected.addAll(selectFairBatch(fresh, batchSize - selected.size(),
                     remainingCapacity(availableCapacityByType, selected)));
 
-            if (selected.size() >= batchSize || candidates.size() < candidatePoolSize) {
+            if (selected.size() >= batchSize || rows.size() < candidatePoolSize) {
                 break;
             }
             // The pool was full yet the batch is not: types that just hit their cap may be
@@ -203,22 +208,38 @@ public class TaskQueueService {
             return Collections.emptyList();
         }
 
-        Instant now = Instant.now();
+        // Claim exactly the selected rows in one statement; only now are full rows (with
+        // payloads) read, and only for tasks that will actually run.
         String workerId = properties.getWorkerId();
-
-        for (Task task : selected) {
-            task.setStatus(TaskStatus.PROCESSING);
-            task.setWorkerId(workerId);
-            task.setStartedAt(now);
-            task.setLastHeartbeat(now);
-            task.setAttemptCount(task.getAttemptCount() + 1);
+        List<UUID> ids = selected.stream().map(Candidate::id).toList();
+        Map<UUID, Task> claimedById = new HashMap<>();
+        for (Task task : taskRepository.claimTasks(ids, workerId, Instant.now())) {
+            claimedById.put(task.getId(), task);
+        }
+        List<Task> claimed = new ArrayList<>(claimedById.size());
+        for (UUID id : ids) {
+            Task task = claimedById.get(id);
+            if (task != null) {
+                claimed.add(task);
+                recordQueueWait(task);
+            }
         }
 
-        selected = taskRepository.saveAll(selected);
-
         log.debug("Dequeued {} tasks for processing by worker {} (from {} candidates)",
-                selected.size(), workerId, totalCandidates);
-        return selected;
+                claimed.size(), workerId, totalCandidates);
+        return claimed;
+    }
+
+    /** Time a task spent runnable but unclaimed: from when it became due until a worker took it. */
+    private void recordQueueWait(Task task) {
+        if (task.getScheduledAt() != null && task.getStartedAt() != null) {
+            long waitMs = Math.max(0, task.getStartedAt().toEpochMilli() - task.getScheduledAt().toEpochMilli());
+            taskMetrics.recordQueueWait(task.getTaskType(), waitMs);
+        }
+    }
+
+    /** Minimal view of a candidate row: enough to choose a fair batch. */
+    private record Candidate(UUID id, String taskType, TaskPriority priority) {
     }
 
     /**
@@ -227,20 +248,20 @@ public class TaskQueueService {
      * priority DESC, created_at ASC, so grouping in encounter order naturally yields
      * priority tiers from highest to lowest, and per-type FIFO order within each tier.
      */
-    private List<Task> selectFairBatch(List<Task> candidates, int batchSize,
-                                       Map<String, Integer> availableCapacityByType) {
-        LinkedHashMap<TaskPriority, LinkedHashMap<String, ArrayDeque<Task>>> byPriority = new LinkedHashMap<>();
-        for (Task task : candidates) {
+    private List<Candidate> selectFairBatch(List<Candidate> candidates, int batchSize,
+                                            Map<String, Integer> availableCapacityByType) {
+        LinkedHashMap<TaskPriority, LinkedHashMap<String, ArrayDeque<Candidate>>> byPriority = new LinkedHashMap<>();
+        for (Candidate task : candidates) {
             byPriority
-                    .computeIfAbsent(task.getPriority(), p -> new LinkedHashMap<>())
-                    .computeIfAbsent(task.getTaskType(), t -> new ArrayDeque<>())
+                    .computeIfAbsent(task.priority(), p -> new LinkedHashMap<>())
+                    .computeIfAbsent(task.taskType(), t -> new ArrayDeque<>())
                     .addLast(task);
         }
 
-        List<Task> result = new ArrayList<>(Math.min(batchSize, candidates.size()));
+        List<Candidate> result = new ArrayList<>(Math.max(0, Math.min(batchSize, candidates.size())));
         Map<String, Integer> selectedByType = new HashMap<>();
 
-        for (LinkedHashMap<String, ArrayDeque<Task>> byType : byPriority.values()) {
+        for (LinkedHashMap<String, ArrayDeque<Candidate>> byType : byPriority.values()) {
             if (result.size() >= batchSize) {
                 break;
             }
@@ -250,22 +271,22 @@ public class TaskQueueService {
             boolean progressed = true;
             while (result.size() < batchSize && progressed) {
                 progressed = false;
-                for (ArrayDeque<Task> queue : byType.values()) {
+                for (ArrayDeque<Candidate> queue : byType.values()) {
                     if (result.size() >= batchSize) {
                         break;
                     }
-                    Task head = queue.peekFirst();
+                    Candidate head = queue.peekFirst();
                     if (head == null) {
                         continue;
                     }
-                    int typeCapacity = availableCapacityByType.getOrDefault(head.getTaskType(), batchSize);
-                    if (selectedByType.getOrDefault(head.getTaskType(), 0) >= typeCapacity) {
+                    int typeCapacity = availableCapacityByType.getOrDefault(head.taskType(), batchSize);
+                    if (selectedByType.getOrDefault(head.taskType(), 0) >= typeCapacity) {
                         continue;
                     }
-                    Task next = queue.pollFirst();
+                    Candidate next = queue.pollFirst();
                     if (next != null) {
                         result.add(next);
-                        selectedByType.merge(next.getTaskType(), 1, Integer::sum);
+                        selectedByType.merge(next.taskType(), 1, Integer::sum);
                         progressed = true;
                     }
                 }
@@ -277,13 +298,13 @@ public class TaskQueueService {
 
     /** Capacity left per capped type after accounting for tasks already selected in this dequeue. */
     private Map<String, Integer> remainingCapacity(Map<String, Integer> availableCapacityByType,
-                                                   List<Task> selected) {
+                                                   List<Candidate> selected) {
         if (availableCapacityByType.isEmpty()) {
             return availableCapacityByType;
         }
         Map<String, Integer> remaining = new HashMap<>(availableCapacityByType);
-        for (Task task : selected) {
-            remaining.computeIfPresent(task.getTaskType(), (type, capacity) -> capacity - 1);
+        for (Candidate task : selected) {
+            remaining.computeIfPresent(task.taskType(), (type, capacity) -> capacity - 1);
         }
         return remaining;
     }
@@ -314,61 +335,45 @@ public class TaskQueueService {
     }
 
     /**
-     * Mark a task as completed
+     * Mark a task as completed. A single guarded UPDATE: it only applies if the task is still
+     * PROCESSING for this attempt, which guards against a late write racing with the timeout
+     * watchdog (which may have already moved this task to SCHEDULED/FAILED and possibly had it
+     * re-dequeued by another worker) or a stale duplicate completion signal.
      */
     @Transactional
-    public void completeTask(UUID taskId, int attemptCount) {
-        taskRepository.findByIdForUpdate(taskId).ifPresent(task -> {
-            // Guards against a late write racing with the timeout watchdog (which may
-            // have already moved this task to PENDING/FAILED and possibly had it
-            // re-dequeued by another worker) or a stale duplicate completion signal.
-            if (task.getStatus() != TaskStatus.PROCESSING || task.getAttemptCount() != attemptCount) {
-                return;
-            }
-            task.setStatus(TaskStatus.COMPLETED);
-            task.setCompletedAt(Instant.now());
-            task.setWorkerId(null);
-            taskRepository.save(task);
-            
-            taskMetrics.recordTaskCompleted(task.getTaskType(), 
-                    task.getCompletedAt().toEpochMilli() - task.getStartedAt().toEpochMilli());
-            
-            log.debug("Completed task: id={}", taskId);
-        });
+    public void completeTask(Task task) {
+        Instant now = Instant.now();
+        if (taskRepository.markCompleted(task.getId(), task.getAttemptCount(), now) == 0) {
+            return;
+        }
+        long durationMs = task.getStartedAt() == null ? 0 : now.toEpochMilli() - task.getStartedAt().toEpochMilli();
+        taskMetrics.recordTaskCompleted(task.getTaskType(), durationMs);
+        log.debug("Completed task: id={}", task.getId());
     }
 
     /**
-     * Mark a task as failed
+     * Mark a task attempt as failed: schedule a retry with backoff while attempts remain,
+     * otherwise fail it permanently. Guarded exactly like {@link #completeTask}.
      */
     @Transactional
-    public void failTask(UUID taskId, int attemptCount, String errorMessage) {
-        taskRepository.findByIdForUpdate(taskId).ifPresent(task -> {
-            if (task.getStatus() != TaskStatus.PROCESSING || task.getAttemptCount() != attemptCount) {
-                return;
-            }
-            if (task.getAttemptCount() < task.getMaxAttempts()) {
-                long delayMs = RetryDelayCalculator.delayMillis(task.getAttemptCount(),
-                        properties.getRetry().getInitialDelayMs(), properties.getRetry().getMaxDelayMs(),
-                        properties.getRetry().getJitterFactor());
-                task.setStatus(TaskStatus.SCHEDULED);
-                task.setScheduledAt(Instant.now().plusMillis(delayMs));
-                task.setWorkerId(null);
-                task.setLastHeartbeat(null);
-                task.setErrorMessage(errorMessage);
+    public void failTask(Task task, String errorMessage) {
+        Instant now = Instant.now();
+        int attempt = task.getAttemptCount();
+        int maxAttempts = task.getMaxAttempts() == null ? 1 : task.getMaxAttempts();
+        if (attempt < maxAttempts) {
+            long delayMs = RetryDelayCalculator.delayMillis(attempt,
+                    properties.getRetry().getInitialDelayMs(), properties.getRetry().getMaxDelayMs(),
+                    properties.getRetry().getJitterFactor());
+            if (taskRepository.scheduleRetry(task.getId(), attempt, now.plusMillis(delayMs), errorMessage, now) > 0) {
+                taskMetrics.recordTaskRetried(task.getTaskType());
                 log.info("Task {} failed, retry scheduled in {}ms (attempt {}/{})",
-                        taskId, delayMs, task.getAttemptCount(), task.getMaxAttempts());
-            } else {
-                // Max retries exceeded
-                task.setStatus(TaskStatus.FAILED);
-                task.setCompletedAt(Instant.now());
-                task.setWorkerId(null);
-                task.setErrorMessage(errorMessage);
-                taskMetrics.recordTaskFailed(task.getTaskType());
-                log.warn("Task {} failed permanently after {} attempts: {}", 
-                        taskId, task.getAttemptCount(), errorMessage);
+                        task.getId(), delayMs, attempt, maxAttempts);
             }
-            taskRepository.save(task);
-        });
+        } else if (taskRepository.markFailed(task.getId(), attempt, errorMessage, now) > 0) {
+            taskMetrics.recordTaskFailed(task.getTaskType());
+            log.warn("Task {} failed permanently after {} attempts: {}",
+                    task.getId(), attempt, errorMessage);
+        }
     }
 
     /**
@@ -423,6 +428,7 @@ public class TaskQueueService {
                     .priority(failedTask.getPriority())
                     .maxAttempts(failedTask.getMaxAttempts())
                     .timeoutSeconds(failedTask.getTimeoutSeconds())
+                    .correlationId(MDC.get(CorrelationIdFilter.MDC_KEY))
                     .status(TaskStatus.PENDING)
                     .scheduledAt(Instant.now())
                     .replayOfTaskId(failedTask.getId())

@@ -125,6 +125,14 @@ public class Task implements Persistable<UUID> {
     private UUID replayOfTaskId;
 
     /**
+     * Correlation id of the request that created the task (from the X-Correlation-Id header),
+     * carried into the logging context while the task runs so enqueue and execution can be
+     * traced together.
+     */
+    @Column(name = "correlation_id", length = 100)
+    private String correlationId;
+
+    /**
      * Max execution time in seconds before the task is cancelled and failed.
      * Falls back to the configured default when not set.
      */

@@ -140,6 +140,10 @@ server:
 
 # Logging Configuration
 logging:
+  pattern:
+    # correlationId/taskId come from the logging context (MDC): the id of the request that
+    # created a task, and the task being processed, so logs can be followed end to end.
+    level: "%5p [%X{correlationId:-}] [%X{taskId:-}]"
   level:
     root: INFO
     com.taskprocessor: DEBUG

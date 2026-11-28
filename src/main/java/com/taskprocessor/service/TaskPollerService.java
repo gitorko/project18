@@ -163,36 +163,34 @@ public class TaskPollerService {
         try {
             if (!taskProcessorExecutor.awaitTermination(shutdownTimeoutSeconds(), TimeUnit.SECONDS)) {
                 log.warn("Some tasks did not complete during application shutdown; forcing shutdown");
+                // Release first: interrupting makes well-behaved handlers throw, and the
+                // resulting failTask would otherwise burn an attempt (or mark the task FAILED).
+                // Once released, those late failure reports are ignored by the attempt guard.
+                releaseUnfinishedTasks();
                 taskProcessorExecutor.shutdownNow();
             }
         } catch (InterruptedException e) {
+            releaseUnfinishedTasks();
             taskProcessorExecutor.shutdownNow();
             Thread.currentThread().interrupt();
         } finally {
             stopHeartbeatScheduler();
-            releaseUnfinishedTasks();
         }
     }
 
     /**
-     * Hand tasks that were still running when the executor was forced down straight back to
+     * Hand tasks that are still running when the executor is about to be forced down straight back to
      * the queue, rather than leaving them PROCESSING until stale-task recovery notices.
      */
     private void releaseUnfinishedTasks() {
         if (processingTasks.isEmpty()) {
             return;
         }
-        try {
-            // Give interrupted handlers a moment to finish their own failure handling first;
-            // the release is guarded on the task still being PROCESSING.
-            taskProcessorExecutor.awaitTermination(2, TimeUnit.SECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
         List<UUID> ids = new ArrayList<>();
         processingTasks.values().forEach(handle -> ids.add(handle.task().getId()));
         try {
             int released = taskQueueService.releaseTasks(ids);
+            taskMetrics.recordTasksReleased(released);
             log.info("Released {} unfinished tasks back to the queue at shutdown", released);
         } catch (Exception e) {
             log.warn("Could not release unfinished tasks at shutdown; stale-task recovery will reclaim them: {}",
@@ -328,7 +326,7 @@ public class TaskPollerService {
                     // give it straight back instead of leaving it PROCESSING with no worker.
                     processingTasks.remove(taskKey, handle);
                     log.warn("Executor rejected task {}, releasing it back to the queue", task.getId());
-                    taskQueueService.releaseTasks(List.of(task.getId()));
+                    taskMetrics.recordTasksReleased(taskQueueService.releaseTasks(List.of(task.getId())));
                 }
             }
 
@@ -448,9 +446,11 @@ public class TaskPollerService {
                     int timeoutSeconds = effectiveTimeoutSeconds(task);
                     log.warn("Task {} exceeded timeout of {}s, cancelling", task.getId(), timeoutSeconds);
                     claimed.future().cancel(true);
+                    taskMetrics.recordTaskTimedOut(task.getTaskType());
+                    taskMetrics.recordAttempt(task.getTaskType(), "timeout",
+                            System.currentTimeMillis() - task.getStartedAt().toEpochMilli());
                     try {
-                        taskQueueService.failTask(task.getId(), task.getAttemptCount(),
-                                "Task exceeded timeout of " + timeoutSeconds + "s");
+                        taskQueueService.failTask(task, "Task exceeded timeout of " + timeoutSeconds + "s");
                     } catch (Exception e) {
                         log.error("Could not record timeout for task {}: {}", task.getId(), e.getMessage(), e);
                     }
