@@ -19,6 +19,8 @@ class ThreadPoolConfigTest {
             assertTrue(thread.isDaemon());
             assertTrue(thread.getName().startsWith("task-processor-"));
             assertFalse(registry.getMeters().isEmpty());
+            assertInstanceOf(java.util.concurrent.ThreadPoolExecutor.AbortPolicy.class,
+                    executor.getRejectedExecutionHandler());
         } finally {
             executor.shutdownNow();
             registry.close();

@@ -20,4 +20,11 @@ class TaskEntityTest {
         assigned.onCreate();
         assertEquals(reservedId, assigned.getId());
     }
+
+    @org.junit.jupiter.api.Test void newTasksAreNewUntilPersistedOrLoaded() {
+        Task task = Task.builder().id(java.util.UUID.randomUUID()).taskType("t").build();
+        org.junit.jupiter.api.Assertions.assertTrue(task.isNew());
+        task.markNotNew();
+        org.junit.jupiter.api.Assertions.assertFalse(task.isNew());
+    }
 }

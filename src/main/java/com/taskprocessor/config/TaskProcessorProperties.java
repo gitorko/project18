@@ -37,6 +37,20 @@ public class TaskProcessorProperties {
 
     private AdmissionConfig admission = new AdmissionConfig();
 
+    private RetentionConfig retention = new RetentionConfig();
+
+    @Data
+    public static class RetentionConfig {
+        /** Whether finished (COMPLETED, FAILED, CANCELLED) tasks are purged automatically. */
+        private boolean enabled = true;
+        /** Finished tasks last updated more than this many hours ago are purged; 0 purges them on the next run. */
+        private long retentionHours = 0;
+        /** How often the purge runs, in milliseconds. */
+        private long purgeIntervalMs = 300000;
+        /** Maximum rows removed per transaction; the purge loops until fewer are found. */
+        private int batchSize = 500;
+    }
+
     @Data
     public static class RetryConfig {
         private long initialDelayMs = 1000;
@@ -107,6 +121,12 @@ public class TaskProcessorProperties {
         private int maxFairnessCandidates = 200;
 
         /**
+         * How long, in seconds, a graceful stop or application shutdown waits for running
+         * tasks to finish before they are interrupted and released back to the queue.
+         */
+        private int shutdownTimeoutSeconds = 30;
+
+        /**
          * Default max execution time for a task before it's cancelled and failed,
          * used when a task doesn't specify its own timeoutSeconds.
          */
@@ -122,6 +142,13 @@ public class TaskProcessorProperties {
          * Interval between heartbeat updates in milliseconds
          */
         private long intervalMs = 5000;
+
+        /**
+         * How often running tasks are checked against their execution timeout, in
+         * milliseconds. Runs independently of heartbeats so timeout precision does not
+         * depend on the heartbeat interval or on database latency.
+         */
+        private long timeoutCheckIntervalMs = 1000;
 
         /**
          * Time after which a task is considered stale and can be reclaimed

@@ -26,6 +26,11 @@ spring:
       hibernate:
         dialect: org.hibernate.dialect.PostgreSQLDialect
         format_sql: true
+        # Batch the per-task UPDATEs/INSERTs issued when claiming and enqueueing tasks.
+        jdbc:
+          batch_size: 50
+        order_inserts: true
+        order_updates: true
     show-sql: false
     open-in-view: false
 
@@ -46,6 +51,14 @@ task-processor:
     # Optional limits keyed by taskType, for example: {REPORT: 100, EMAIL: 1000}
     max-outstanding-by-type: {}
 
+  retention:
+    # Purge finished (COMPLETED/FAILED/CANCELLED) tasks older than the window below.
+    enabled: true
+    # 0 = purge finished tasks on the next run (every purge-interval-ms)
+    retention-hours: 0
+    purge-interval-ms: 300000
+    batch-size: 500
+
   scheduler:
     # How often each instance checks for due one-time and recurring tasks.
     poll-interval-ms: 1000
@@ -62,7 +75,8 @@ task-processor:
     # Increase this for higher throughput
     pool-size: 5
     
-    # Maximum threads the pool can grow to
+    # Ceiling for runtime resizing. The poller only claims what fits in pool-size, so the
+    # pool does not grow toward this on its own.
     max-pool-size: 20
 
     # Optional per-instance caps. Leave empty to use the shared pool without type caps.
@@ -83,12 +97,18 @@ task-processor:
     # Maximum poll interval when queue is empty
     max-poll-interval-ms: 5000
     
+    # Seconds to wait for running tasks on shutdown before interrupting and releasing them
+    shutdown-timeout-seconds: 30
+
     # Use adaptive polling (longer intervals when queue is empty)
     adaptive-polling: true
   
   heartbeat:
     # How often to send heartbeats (milliseconds)
     interval-ms: 5000
+
+    # How often running tasks are checked against their timeout (milliseconds)
+    timeout-check-interval-ms: 1000
     
     # Time after which a task is considered stale (milliseconds)
     # Should be > heartbeat interval * 3 to allow for missed heartbeats

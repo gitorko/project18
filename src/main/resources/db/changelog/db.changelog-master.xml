@@ -10,5 +10,6 @@
     <include file="db/changelog/changes/003-map-numeric-priorities.sql" relativeToChangelogFile="false"/>
     <include file="db/changelog/changes/004-recurring-schedules.sql" relativeToChangelogFile="false"/>
     <include file="db/changelog/changes/005-retries-idempotency-admission.sql" relativeToChangelogFile="false"/>
+    <include file="db/changelog/changes/006-queue-index-tuning.sql" relativeToChangelogFile="false"/>
 
 </databaseChangeLog>

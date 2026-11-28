@@ -47,6 +47,24 @@ public interface TaskRepository extends JpaRepository<Task, UUID> {
         """, nativeQuery = true)
     List<Task> findTasksForProcessing(@Param("now") Instant now, @Param("candidatePoolSize") int candidatePoolSize);
 
+    /**
+     * Same as {@link #findTasksForProcessing} but skips task types that have no remaining
+     * capacity on this worker, so a saturated type cannot fill the whole candidate pool
+     * and starve runnable work of other types. {@code excludedTypes} must not be empty.
+     */
+    @Query(value = """
+        SELECT * FROM tasks
+        WHERE status = 'PENDING'
+        AND scheduled_at <= :now
+        AND task_type NOT IN (:excludedTypes)
+        ORDER BY priority DESC, created_at ASC
+        LIMIT :candidatePoolSize
+        FOR UPDATE SKIP LOCKED
+        """, nativeQuery = true)
+    List<Task> findTasksForProcessingExcludingTypes(@Param("now") Instant now,
+                                                    @Param("candidatePoolSize") int candidatePoolSize,
+                                                    @Param("excludedTypes") Collection<String> excludedTypes);
+
     /** Promote due scheduled tasks and delayed retries, distributing rows safely across workers. */
     @Modifying
     @Query(value = """
@@ -145,6 +163,60 @@ public interface TaskRepository extends JpaRepository<Task, UUID> {
     @Modifying
     @Query("UPDATE Task t SET t.lastHeartbeat = :heartbeat WHERE t.id = :taskId AND t.workerId = :workerId")
     int updateHeartbeat(@Param("taskId") UUID taskId, @Param("workerId") String workerId, @Param("heartbeat") Instant heartbeat);
+
+    /** Update heartbeats for many tasks in a single round trip. */
+    @Modifying
+    @Query("UPDATE Task t SET t.lastHeartbeat = :heartbeat "
+            + "WHERE t.id IN :taskIds AND t.workerId = :workerId AND t.status = 'PROCESSING'")
+    int updateHeartbeats(@Param("taskIds") Collection<UUID> taskIds, @Param("workerId") String workerId,
+                         @Param("heartbeat") Instant heartbeat);
+
+    /**
+     * Hand tasks that this worker was still running at shutdown straight back to the queue.
+     * The aborted attempt is not counted against the retry budget.
+     */
+    @Modifying
+    @Query("""
+        UPDATE Task t
+        SET t.status = 'PENDING',
+            t.workerId = null,
+            t.lastHeartbeat = null,
+            t.attemptCount = t.attemptCount - 1,
+            t.updatedAt = :now
+        WHERE t.id IN :taskIds
+        AND t.status = 'PROCESSING'
+        AND t.workerId = :workerId
+        AND t.attemptCount > 0
+        """)
+    int releaseProcessingTasks(@Param("taskIds") Collection<UUID> taskIds, @Param("workerId") String workerId,
+                               @Param("now") Instant now);
+
+    /** Select finished (COMPLETED, FAILED, CANCELLED) tasks old enough to purge, locking them so concurrent purgers do not collide. */
+    @Query(value = """
+        SELECT id FROM tasks
+        WHERE status IN ('COMPLETED', 'FAILED', 'CANCELLED')
+        AND updated_at < :cutoff
+        AND NOT EXISTS (SELECT 1 FROM task_schedules s WHERE s.active_task_id = tasks.id)
+        ORDER BY updated_at ASC
+        LIMIT :limit
+        FOR UPDATE SKIP LOCKED
+        """, nativeQuery = true)
+    List<UUID> findPurgeableTaskIds(@Param("cutoff") Instant cutoff, @Param("limit") int limit);
+
+    /** Detach replay tasks from sources that are about to be purged. */
+    @Modifying
+    @Query(value = "UPDATE tasks SET replay_of_task_id = NULL WHERE replay_of_task_id IN (:ids)",
+            nativeQuery = true)
+    int clearReplaySource(@Param("ids") Collection<UUID> ids);
+
+    /** Remove idempotency reservations that point at tasks about to be purged. */
+    @Modifying
+    @Query(value = "DELETE FROM task_idempotency WHERE task_id IN (:ids)", nativeQuery = true)
+    int deleteIdempotencyRecords(@Param("ids") Collection<UUID> ids);
+
+    @Modifying
+    @Query(value = "DELETE FROM tasks WHERE id IN (:ids)", nativeQuery = true)
+    int deleteTasksByIds(@Param("ids") Collection<UUID> ids);
 
     /**
      * Find tasks currently being processed by a specific worker

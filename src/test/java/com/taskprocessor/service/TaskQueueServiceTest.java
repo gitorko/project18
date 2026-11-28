@@ -91,13 +91,60 @@ class TaskQueueServiceTest {
     @Test void typeCapacitySkipsCappedTypeAndUsesOtherAvailableTypes() {
         Task capped = task("heavy", TaskPriority.HIGH, 1);
         Task other = task("fast", TaskPriority.HIGH, 1);
-        when(repository.findTasksForProcessing(any(), anyInt())).thenReturn(List.of(capped, other));
+        when(repository.findTasksForProcessingExcludingTypes(any(), anyInt(), eq(java.util.Set.of("heavy"))))
+                .thenReturn(List.of(other));
         when(repository.saveAll(anyList())).thenAnswer(inv -> inv.getArgument(0));
 
         List<Task> selected = service.dequeueTasks(1, java.util.Map.of("heavy", 0));
 
         assertEquals(List.of(other), selected);
         assertEquals(TaskStatus.PENDING, capped.getStatus());
+        verify(repository, never()).findTasksForProcessing(any(), anyInt());
+    }
+
+    @Test void saturatedTypeCannotCrowdOutOtherTypesFromTheCandidatePool() {
+        // batch 3 -> pool of 15, entirely filled by the capped type
+        List<Task> heavy = java.util.stream.IntStream.range(0, 15)
+                .mapToObj(i -> task("heavy", TaskPriority.HIGH, 1)).toList();
+        Task fast1 = task("fast", TaskPriority.MEDIUM, 1), fast2 = task("fast", TaskPriority.MEDIUM, 1);
+        when(repository.findTasksForProcessing(any(), anyInt())).thenReturn(heavy);
+        when(repository.findTasksForProcessingExcludingTypes(any(), anyInt(), eq(java.util.Set.of("heavy"))))
+                .thenReturn(List.of(fast1, fast2));
+        when(repository.saveAll(anyList())).thenAnswer(inv -> inv.getArgument(0));
+
+        List<Task> selected = service.dequeueTasks(3, java.util.Map.of("heavy", 1));
+
+        assertEquals(List.of(heavy.get(0), fast1, fast2), selected);
+    }
+
+    @Test void refetchSkipsRowsAlreadyConsideredInAnEarlierPass() {
+        List<Task> heavy = java.util.stream.IntStream.range(0, 15)
+                .mapToObj(i -> task("heavy", TaskPriority.HIGH, 1)).toList();
+        Task fast = task("fast", TaskPriority.MEDIUM, 1);
+        when(repository.findTasksForProcessing(any(), anyInt())).thenReturn(heavy);
+        when(repository.findTasksForProcessingExcludingTypes(any(), anyInt(), any()))
+                .thenReturn(List.of(heavy.get(0), fast));
+        when(repository.saveAll(anyList())).thenAnswer(inv -> inv.getArgument(0));
+
+        List<Task> selected = service.dequeueTasks(3, java.util.Map.of("heavy", 1));
+
+        assertEquals(List.of(heavy.get(0), fast), selected);
+        assertEquals(1, heavy.get(0).getAttemptCount());
+    }
+
+    @Test void updatesHeartbeatsInOneStatement() {
+        List<UUID> ids = List.of(UUID.randomUUID(), UUID.randomUUID());
+        service.updateHeartbeats(ids);
+        verify(repository).updateHeartbeats(eq(ids), eq("worker-1"), any());
+        service.updateHeartbeats(List.of());
+        verifyNoMoreInteractions(repository);
+    }
+
+    @Test void releaseTasksReturnsClaimsToTheQueue() {
+        List<UUID> ids = List.of(UUID.randomUUID());
+        when(repository.releaseProcessingTasks(eq(ids), eq("worker-1"), any())).thenReturn(1);
+        assertEquals(1, service.releaseTasks(ids));
+        assertEquals(0, service.releaseTasks(List.of()));
     }
 
     @Test void completeTaskUpdatesOnlyProcessingTasks() {
@@ -230,8 +277,6 @@ class TaskQueueServiceTest {
     }
 
     @Test void summaryIncludesTypeCountsAndRuntimeEstimate() {
-        when(repository.countByStatus(any())).thenReturn(2L);
-        when(repository.countByTaskTypeAndStatus(TaskStatus.PENDING)).thenReturn(List.<Object[]>of(new Object[]{"x", 2L}));
         when(repository.countByTaskTypeAndStatus()).thenReturn(List.<Object[]>of(
                 new Object[]{"x", TaskStatus.PENDING, 2L}, new Object[]{"x", TaskStatus.PROCESSING, 1L}));
         when(metrics.getAverageProcessingTimeMs()).thenReturn(1000.0);
@@ -240,9 +285,13 @@ class TaskQueueServiceTest {
         when(metrics.getConfiguredPoolSize()).thenReturn(2);
         var summary = service.getTaskSummary();
         assertEquals(2L, summary.getPendingTasks());
+        assertEquals(1L, summary.getProcessingTasks());
+        assertEquals(3L, summary.getTotalTasks());
+        assertEquals(java.util.Map.of("x", 2L), summary.getPendingByType());
         assertEquals(2L, summary.getByTaskType().get("x").getPendingTasks());
         assertEquals(1L, summary.getByTaskType().get("x").getProcessingTasks());
-        assertEquals(2L, summary.getEstimatedBacklogCompletionSeconds());
+        assertEquals(2L, summary.getEstimatedBacklogCompletionSeconds()); // (2+1 outstanding) * 1s / 2 workers
+        verify(repository, never()).countByStatus(any());
     }
 
     private Task task(String type, TaskPriority priority, int maxAttempts) {

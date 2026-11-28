@@ -40,6 +40,9 @@ public class TaskQueueService {
     private final QueueAdmissionService queueAdmissionService;
     private final TaskIdempotencyRepository idempotencyRepository;
 
+    /** How many times dequeue may look deeper in the queue when capped types crowd out other work. */
+    private static final int MAX_CANDIDATE_REFETCHES = 3;
+
     /**
      * Enqueue a single task
      */
@@ -101,6 +104,7 @@ public class TaskQueueService {
     public List<TaskResponse> enqueueTasks(BulkCreateTaskRequest request) {
         List<Task> tasks = request.getTasks().stream()
                 .map(req -> Task.builder()
+                        .id(UUID.randomUUID())
                         .taskType(req.getTaskType())
                         .payload(req.getPayload())
                         .priority(req.getPriority() != null ? req.getPriority() : TaskPriority.MEDIUM)
@@ -147,13 +151,57 @@ public class TaskQueueService {
                 batchSize * properties.getPoller().getFairnessCandidateMultiplier(),
                 properties.getPoller().getMaxFairnessCandidates());
 
-        List<Task> candidates = taskRepository.findTasksForProcessing(Instant.now(), candidatePoolSize);
+        // Types with no capacity left are excluded in SQL so they cannot fill the candidate
+        // pool and starve other types of work.
+        Set<String> excludedTypes = new LinkedHashSet<>();
+        availableCapacityByType.forEach((type, capacity) -> {
+            if (capacity <= 0) {
+                excludedTypes.add(type);
+            }
+        });
 
-        if (candidates.isEmpty()) {
-            return Collections.emptyList();
+        List<Task> selected = new ArrayList<>();
+        Set<UUID> seen = new HashSet<>();
+        int totalCandidates = 0;
+
+        for (int pass = 0; pass <= MAX_CANDIDATE_REFETCHES; pass++) {
+            List<Task> candidates = excludedTypes.isEmpty()
+                    ? taskRepository.findTasksForProcessing(Instant.now(), candidatePoolSize)
+                    : taskRepository.findTasksForProcessingExcludingTypes(
+                            Instant.now(), candidatePoolSize, excludedTypes);
+            totalCandidates += candidates.size();
+
+            // Rows locked by this transaction are returned again on a refetch; skip them.
+            List<Task> fresh = new ArrayList<>(candidates.size());
+            for (Task candidate : candidates) {
+                if (seen.add(candidate.getId())) {
+                    fresh.add(candidate);
+                }
+            }
+
+            selected.addAll(selectFairBatch(fresh, batchSize - selected.size(),
+                    remainingCapacity(availableCapacityByType, selected)));
+
+            if (selected.size() >= batchSize || candidates.size() < candidatePoolSize) {
+                break;
+            }
+            // The pool was full yet the batch is not: types that just hit their cap may be
+            // crowding out runnable work deeper in the queue. Exclude them and look again.
+            Map<String, Integer> remaining = remainingCapacity(availableCapacityByType, selected);
+            boolean grew = false;
+            for (var entry : remaining.entrySet()) {
+                if (entry.getValue() <= 0 && excludedTypes.add(entry.getKey())) {
+                    grew = true;
+                }
+            }
+            if (!grew) {
+                break;
+            }
         }
 
-        List<Task> selected = selectFairBatch(candidates, batchSize, availableCapacityByType);
+        if (selected.isEmpty()) {
+            return Collections.emptyList();
+        }
 
         Instant now = Instant.now();
         String workerId = properties.getWorkerId();
@@ -169,7 +217,7 @@ public class TaskQueueService {
         selected = taskRepository.saveAll(selected);
 
         log.debug("Dequeued {} tasks for processing by worker {} (from {} candidates)",
-                selected.size(), workerId, candidates.size());
+                selected.size(), workerId, totalCandidates);
         return selected;
     }
 
@@ -225,6 +273,19 @@ public class TaskQueueService {
         }
 
         return result;
+    }
+
+    /** Capacity left per capped type after accounting for tasks already selected in this dequeue. */
+    private Map<String, Integer> remainingCapacity(Map<String, Integer> availableCapacityByType,
+                                                   List<Task> selected) {
+        if (availableCapacityByType.isEmpty()) {
+            return availableCapacityByType;
+        }
+        Map<String, Integer> remaining = new HashMap<>(availableCapacityByType);
+        for (Task task : selected) {
+            remaining.computeIfPresent(task.getTaskType(), (type, capacity) -> capacity - 1);
+        }
+        return remaining;
     }
 
     private String fingerprint(Task task) {
@@ -318,6 +379,27 @@ public class TaskQueueService {
         taskRepository.updateHeartbeat(taskId, properties.getWorkerId(), Instant.now());
     }
 
+    /** Update heartbeats for all given tasks in a single statement. */
+    @Transactional
+    public void updateHeartbeats(Collection<UUID> taskIds) {
+        if (taskIds.isEmpty()) {
+            return;
+        }
+        taskRepository.updateHeartbeats(taskIds, properties.getWorkerId(), Instant.now());
+    }
+
+    /**
+     * Return tasks this worker still holds to the queue, e.g. at shutdown or when they could
+     * not be handed to the executor. The aborted attempt does not count against retries.
+     */
+    @Transactional
+    public int releaseTasks(Collection<UUID> taskIds) {
+        if (taskIds.isEmpty()) {
+            return 0;
+        }
+        return taskRepository.releaseProcessingTasks(taskIds, properties.getWorkerId(), Instant.now());
+    }
+
     /**
      * Get task by ID
      */
@@ -335,6 +417,7 @@ public class TaskQueueService {
                 throw new TaskNotReplayableException("Only failed tasks can be replayed");
             }
             Task replay = Task.builder()
+                    .id(UUID.randomUUID())
                     .taskType(failedTask.getTaskType())
                     .payload(failedTask.getPayload())
                     .priority(failedTask.getPriority())
@@ -370,26 +453,22 @@ public class TaskQueueService {
      */
     @Transactional(readOnly = true)
     public TaskSummaryResponse getTaskSummary() {
-        long pending = taskRepository.countByStatus(TaskStatus.PENDING);
-        long processing = taskRepository.countByStatus(TaskStatus.PROCESSING);
-        long completed = taskRepository.countByStatus(TaskStatus.COMPLETED);
-        long failed = taskRepository.countByStatus(TaskStatus.FAILED);
-        long cancelled = taskRepository.countByStatus(TaskStatus.CANCELLED);
-        long scheduled = taskRepository.countByStatus(TaskStatus.SCHEDULED);
-
-        // Get pending tasks by type
+        // One grouped query yields every per-status total, per-type breakdown and the
+        // pending-by-type map, instead of a separate COUNT per status.
+        Map<TaskStatus, Long> totals = new EnumMap<>(TaskStatus.class);
         Map<String, Long> pendingByType = new HashMap<>();
-        taskRepository.countByTaskTypeAndStatus(TaskStatus.PENDING)
-                .forEach(row -> pendingByType.put((String) row[0], (Long) row[1]));
-
         Map<String, TaskTypeSummary> byTaskType = new TreeMap<>();
         taskRepository.countByTaskTypeAndStatus().forEach(row -> {
             String type = (String) row[0];
             TaskStatus status = (TaskStatus) row[1];
             long count = (Long) row[2];
+            totals.merge(status, count, Long::sum);
             TaskTypeSummary current = byTaskType.computeIfAbsent(type, ignored -> TaskTypeSummary.builder().build());
             switch (status) {
-                case PENDING -> current.setPendingTasks(count);
+                case PENDING -> {
+                    current.setPendingTasks(count);
+                    pendingByType.put(type, count);
+                }
                 case SCHEDULED -> current.setScheduledTasks(count);
                 case PROCESSING -> current.setProcessingTasks(count);
                 case COMPLETED -> current.setCompletedTasks(count);
@@ -399,6 +478,13 @@ public class TaskQueueService {
             }
         });
         byTaskType.forEach((type, stats) -> stats.setAvgProcessingTimeMs(taskMetrics.getAverageProcessingTimeMs(type)));
+
+        long pending = totals.getOrDefault(TaskStatus.PENDING, 0L);
+        long processing = totals.getOrDefault(TaskStatus.PROCESSING, 0L);
+        long completed = totals.getOrDefault(TaskStatus.COMPLETED, 0L);
+        long failed = totals.getOrDefault(TaskStatus.FAILED, 0L);
+        long cancelled = totals.getOrDefault(TaskStatus.CANCELLED, 0L);
+        long scheduled = totals.getOrDefault(TaskStatus.SCHEDULED, 0L);
 
         long outstandingTasks = pending + processing;
         double averageMs = taskMetrics.getAverageProcessingTimeMs();

@@ -25,6 +25,10 @@ public class ThreadPoolConfig {
     /**
      * Creates a ThreadPoolExecutor that can be dynamically resized at runtime.
      * The pool is monitored via Micrometer metrics.
+     *
+     * Note that the work queue is bounded and the poller only claims as many tasks as the
+     * core size allows, so the pool does not grow toward {@code maxPoolSize} on its own;
+     * the maximum is a ceiling for runtime resizing.
      */
     @Bean(name = "taskProcessorExecutor")
     public ThreadPoolExecutor taskProcessorExecutor() {
@@ -41,7 +45,10 @@ public class ThreadPoolConfig {
                     thread.setDaemon(true);
                     return thread;
                 },
-                new ThreadPoolExecutor.CallerRunsPolicy()
+                // The poller only claims what fits in the pool, so rejection means the executor is
+                // shutting down or was resized under it. Failing fast lets the poller release the
+                // claimed task; CallerRunsPolicy would instead run it on the poller thread.
+                new ThreadPoolExecutor.AbortPolicy()
         );
 
         // Allow core threads to timeout when idle

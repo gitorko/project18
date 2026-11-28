@@ -6,8 +6,9 @@ A distributed task queue implementation using Spring Boot and PostgreSQL. Simila
 
 - **Distributed Queue**: Multiple pods/nodes can process tasks without duplicates using PostgreSQL's `SELECT ... FOR UPDATE SKIP LOCKED`
 - **Configurable Thread Pool**: Dynamically adjust processing capacity at runtime
-- **Adaptive Polling**: Reduces DB load when queue is empty
-- **Heartbeat Mechanism**: Detects and recovers stuck tasks from crashed workers
+- **Adaptive Polling**: Reduces DB load when queue is empty, and polls early when a finished task frees a worker slot
+- **Heartbeat Mechanism**: Batched heartbeats detect and recover stuck tasks from crashed workers; tasks still running at shutdown are released straight back to the queue
+- **Retention**: Finished (completed, failed, cancelled) tasks are purged automatically after a configurable window
 - **Retry Support**: Exponential retry delay with jitter and manual replay of failed tasks
 - **Priority Queue**: Higher priority tasks are processed first
 - **Scheduled Tasks**: Run once at a specified time or repeat on a fixed-delay interval
@@ -293,7 +294,9 @@ future submissions, priority tiers, or remaining runtime of active tasks.
 
 #### Replay a Failed Task
 
-Tasks with `FAILED` status remain available as dead-letter records:
+Tasks with `FAILED` status remain available as dead-letter records until the
+retention purge removes them (by default on its next run; see
+`retention.retention-hours`):
 
 ```bash
 GET /api/v1/tasks?status=FAILED
@@ -387,6 +390,7 @@ task-processor:
     batch-size: 10         # Tasks per poll
     poll-interval-ms: 1000 # Base poll interval
     adaptive-polling: true # Reduce polling when queue empty
+    shutdown-timeout-seconds: 30 # Wait for running tasks on shutdown before releasing them
     # Optional per-instance active-task caps by type:
     # max-concurrent-by-type:
     #   REPORT: 2
@@ -405,6 +409,13 @@ task-processor:
     interval-ms: 5000      # Heartbeat frequency
     stale-threshold-ms: 30000  # When to consider task stuck
     recovery-interval-ms: 10000 # Stale task check frequency
+    timeout-check-interval-ms: 1000 # Task execution timeout check frequency
+
+  retention:
+    enabled: true          # Purge finished (COMPLETED/FAILED/CANCELLED) tasks
+    retention-hours: 0     # 0 = purge finished tasks on the next run; e.g. 168 keeps them 7 days
+    purge-interval-ms: 300000
+    batch-size: 500
 ```
 
 Additional settings and defaults:
@@ -426,6 +437,12 @@ Additional settings and defaults:
 | `heartbeat.interval-ms` | 5,000 ms | Worker heartbeat interval. |
 | `heartbeat.stale-threshold-ms` | 30,000 ms | Time without heartbeat before a task is stale. |
 | `heartbeat.recovery-interval-ms` | 10,000 ms | How often stale tasks are recovered. |
+| `heartbeat.timeout-check-interval-ms` | 1,000 ms | How often running tasks are checked against their timeout. |
+| `poller.shutdown-timeout-seconds` | 30 s | How long a stop or shutdown waits for running tasks before interrupting and releasing them. |
+| `retention.enabled` | true | Purge `COMPLETED`, `FAILED` and `CANCELLED` tasks once they pass the retention window. |
+| `retention.retention-hours` | 0 h | Age (since last update) after which a finished task is purged; `0` purges on the next run. |
+| `retention.purge-interval-ms` | 300,000 ms | How often the purge runs. |
+| `retention.batch-size` | 500 | Rows deleted per transaction; the purge repeats until a batch comes back short. |
 
 ### Environment Variables
 
@@ -485,6 +502,7 @@ broker is required.
 | `TaskProcessorService` | Resolve a `TaskHandler`, execute it, and report success or failure. |
 | `ScheduledTaskService` | Promote due tasks and materialize recurring occurrences. |
 | `StaleTaskRecoveryService` | Reset stale in-flight work or mark exhausted tasks as failed. |
+| `TaskRetentionService` | Purge finished tasks (`COMPLETED`, `FAILED`, `CANCELLED`) older than the retention window. |
 | `TaskRepository` | JPA and PostgreSQL-specific queue operations, including `FOR UPDATE SKIP LOCKED`. |
 | `TaskMetrics` | Micrometer counters, timers, gauges, and process-local runtime/rate samples. |
 
@@ -558,6 +576,12 @@ leader or distributed lock. The lock is held only while the transaction marks
 selected rows `PROCESSING`, stores the worker ID and timestamps, and increments
 `attemptCount`; it is released before handlers run.
 
+Task types that have reached their `max-concurrent-by-type` cap on this worker
+are excluded in SQL (`task_type NOT IN (...)`), so a saturated type cannot fill
+the candidate pool and block other types. If a type reaches its cap part-way
+through a batch while the pool was full, dequeue looks deeper in the queue (up
+to three refetches), skipping rows it has already considered.
+
 Only `PENDING` rows are candidates for polling. Rows marked `FAILED` stay in the
 database for inspection and are excluded from the claim query and its partial
 pending-task index, even when there are many failed rows. A failed task runs
@@ -586,6 +610,11 @@ default). The first interval is `poll-interval-ms` (1,000 ms by default).
 When adaptive polling is disabled, empty polls do not change the interval.
 Runtime updates take effect after the current poll cycle completes.
 
+When a task finishes and the previous poll found work, the poller polls again
+instead of waiting for the next interval, so a freed slot does not sit idle.
+This early poll is rate-limited by `min-poll-interval-ms` and is skipped while
+the queue is empty, so adaptive backoff still protects the database.
+
 Each worker has one thread pool with a bounded 1,000-task executor queue. The
 poller calculates available claim capacity as:
 
@@ -597,7 +626,10 @@ It claims at most that capacity and the configured batch size, avoiding
 intentional local executor backlog. `poolSize` changes the executor's core
 size. Although `maxPoolSize` is configurable, normal polling is limited by
 available core capacity, so it does not automatically scale execution above
-the core size. In practice, set `poolSize` to the concurrency you want.
+the core size; it acts only as a ceiling for runtime resizing. In practice, set
+`poolSize` to the concurrency you want. If the executor rejects a claimed task
+(for example during shutdown), the task is released back to the queue instead of
+being run on the polling thread.
 
 Per-type active-task caps are enforced independently on each worker, not across
 the cluster. All types share one executor; there are no separate per-type
@@ -640,11 +672,18 @@ code that ignores interruption. Use client-side I/O timeouts and
 interruption-aware handlers. Non-interruptible code may continue occupying its
 thread even after the database task is retried or failed.
 
-Workers update `last_heartbeat` for tracked tasks every 5 seconds by default.
+Workers update `last_heartbeat` for all tracked tasks every 5 seconds by
+default, using a single batched `UPDATE`. Timeouts are enforced by a separate
+watchdog thread (every second by default, `heartbeat.timeout-check-interval-ms`),
+so timeout precision does not depend on the heartbeat interval or on database
+latency.
 A separate recovery process runs every 10 seconds and considers a processing
 task stale after 30 seconds without a heartbeat. Stale tasks with attempts
 remaining return to `PENDING`; tasks at their attempt limit become `FAILED`.
-Recovery does not increment attempts. A paused worker can miss the stale
+Recovery does not increment attempts. On graceful shutdown, tasks that are still
+running after `poller.shutdown-timeout-seconds` are interrupted and released
+straight back to `PENDING`; this aborted attempt is not counted against
+`maxAttempts`. A paused worker can miss the stale
 threshold and have its task reclaimed elsewhere, so duplicate execution must
 be expected.
 
@@ -687,8 +726,13 @@ database summaries but do not currently increment Micrometer failure counters.
 
 - PostgreSQL is the only queue storage implementation; there is no separate
   broker adapter.
-- Completed and failed tasks have no built-in retention or cleanup policy and
-  continue contributing to storage and summary totals.
+- Finished tasks (`COMPLETED`, `FAILED`, `CANCELLED`) are purged after
+  `retention.retention-hours` (default `0`: on the next purge run, every 5
+  minutes), so finished tasks, including failed ones, disappear quickly and can
+  no longer be fetched or replayed; raise it (e.g. `168` for 7 days) if you
+  rely on status lookups or replay.
+  Purging a task also removes its idempotency key, so the same key can create a
+  new task afterwards.
 - Idempotency keys apply to single-task creation, not bulk submissions.
 - The REST API has no built-in authentication or authorization.
 - Recurring schedules support fixed-delay intervals, not cron or calendar

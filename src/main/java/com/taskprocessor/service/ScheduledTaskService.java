@@ -100,6 +100,7 @@ public class ScheduledTaskService {
         List<TaskSchedule> dueSchedules = scheduleRepository.findDueSchedulesForUpdate(now, DISPATCH_BATCH_SIZE);
         for (TaskSchedule schedule : dueSchedules) {
             Task occurrence = Task.builder()
+                    .id(UUID.randomUUID())
                     .taskType(schedule.getTaskType())
                     .payload(schedule.getPayload())
                     .priority(schedule.getPriority())

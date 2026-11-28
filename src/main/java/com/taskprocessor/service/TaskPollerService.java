@@ -10,10 +10,13 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -41,6 +44,15 @@ public class TaskPollerService {
     
     private ScheduledExecutorService pollerScheduler;
     private ScheduledExecutorService heartbeatScheduler;
+
+    // Poll scheduling state, guarded by pollLock. A task finishing frees a worker slot, so it
+    // can request an early poll instead of letting the slot idle until the next interval.
+    private final Object pollLock = new Object();
+    private boolean polling;
+    private boolean wakeRequested;
+    private ScheduledFuture<?> nextPoll;
+    private long lastPollStartNanos;
+    private volatile boolean lastPollFoundWork;
 
     // Track tasks being processed by this worker for heartbeat updates and timeout enforcement
     private final ConcurrentHashMap<String, ProcessingHandle> processingTasks = new ConcurrentHashMap<>();
@@ -87,6 +99,11 @@ public class TaskPollerService {
             return t;
         });
         
+        synchronized (pollLock) {
+            polling = false;
+            wakeRequested = false;
+            nextPoll = null;
+        }
         pollerScheduler.execute(this::pollAndScheduleNext);
 
         startHeartbeatSchedulerIfNeeded();
@@ -120,7 +137,7 @@ public class TaskPollerService {
 
         // Keep the executor alive so the poller can be started again. Continue
         // heartbeats while active tasks drain, then stop the heartbeat scheduler.
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(shutdownTimeoutSeconds());
         while (hasInFlightWork() && System.nanoTime() < deadline) {
             try {
                 TimeUnit.MILLISECONDS.sleep(100);
@@ -144,7 +161,7 @@ public class TaskPollerService {
         stop();
         taskProcessorExecutor.shutdown();
         try {
-            if (!taskProcessorExecutor.awaitTermination(30, TimeUnit.SECONDS)) {
+            if (!taskProcessorExecutor.awaitTermination(shutdownTimeoutSeconds(), TimeUnit.SECONDS)) {
                 log.warn("Some tasks did not complete during application shutdown; forcing shutdown");
                 taskProcessorExecutor.shutdownNow();
             }
@@ -153,15 +170,50 @@ public class TaskPollerService {
             Thread.currentThread().interrupt();
         } finally {
             stopHeartbeatScheduler();
+            releaseUnfinishedTasks();
         }
+    }
+
+    /**
+     * Hand tasks that were still running when the executor was forced down straight back to
+     * the queue, rather than leaving them PROCESSING until stale-task recovery notices.
+     */
+    private void releaseUnfinishedTasks() {
+        if (processingTasks.isEmpty()) {
+            return;
+        }
+        try {
+            // Give interrupted handlers a moment to finish their own failure handling first;
+            // the release is guarded on the task still being PROCESSING.
+            taskProcessorExecutor.awaitTermination(2, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        List<UUID> ids = new ArrayList<>();
+        processingTasks.values().forEach(handle -> ids.add(handle.task().getId()));
+        try {
+            int released = taskQueueService.releaseTasks(ids);
+            log.info("Released {} unfinished tasks back to the queue at shutdown", released);
+        } catch (Exception e) {
+            log.warn("Could not release unfinished tasks at shutdown; stale-task recovery will reclaim them: {}",
+                    e.getMessage());
+        }
+        processingTasks.clear();
+    }
+
+    private int shutdownTimeoutSeconds() {
+        return Math.max(0, properties.getPoller().getShutdownTimeoutSeconds());
     }
 
     private void startHeartbeatSchedulerIfNeeded() {
         if (heartbeatScheduler != null && !heartbeatScheduler.isShutdown()) {
             return;
         }
-        heartbeatScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "task-heartbeat");
+        // Two threads so the (database-bound) heartbeat write can never delay the timeout
+        // watchdog, and vice versa.
+        AtomicInteger threadCounter = new AtomicInteger();
+        heartbeatScheduler = Executors.newScheduledThreadPool(2, r -> {
+            Thread t = new Thread(r, "task-heartbeat-" + threadCounter.incrementAndGet());
             t.setDaemon(true);
             return t;
         });
@@ -171,6 +223,9 @@ public class TaskPollerService {
                 properties.getHeartbeat().getIntervalMs(),
                 TimeUnit.MILLISECONDS
         );
+        long timeoutCheckMs = Math.max(1, properties.getHeartbeat().getTimeoutCheckIntervalMs());
+        heartbeatScheduler.scheduleWithFixedDelay(
+                this::enforceTimeouts, timeoutCheckMs, timeoutCheckMs, TimeUnit.MILLISECONDS);
     }
 
     private void stopHeartbeatScheduler() {
@@ -221,6 +276,7 @@ public class TaskPollerService {
             int fetchSize = Math.min(currentBatchSize, availableCapacity);
             List<Task> tasks = taskQueueService.dequeueTasks(fetchSize, availableCapacityByType());
 
+            lastPollFoundWork = !tasks.isEmpty();
             if (tasks.isEmpty()) {
                 // Adaptive polling: increase interval when queue is empty
                 if (properties.getPoller().isAdaptivePolling() && processingTasks.isEmpty()) {
@@ -255,6 +311,7 @@ public class TaskPollerService {
                         if (handle != null) {
                             processingTasks.remove(taskKey, handle);
                         }
+                        requestEarlyPoll();
                     }
                     return null;
                 });
@@ -264,7 +321,15 @@ public class TaskPollerService {
                 ProcessingHandle handle = new ProcessingHandle(task, future);
                 handleReference.set(handle);
                 processingTasks.put(taskKey, handle);
-                taskProcessorExecutor.execute(future);
+                try {
+                    taskProcessorExecutor.execute(future);
+                } catch (RejectedExecutionException rejected) {
+                    // Claimed but could not be queued (executor shutting down or saturated):
+                    // give it straight back instead of leaving it PROCESSING with no worker.
+                    processingTasks.remove(taskKey, handle);
+                    log.warn("Executor rejected task {}, releasing it back to the queue", task.getId());
+                    taskQueueService.releaseTasks(List.of(task.getId()));
+                }
             }
 
             taskMetrics.recordTasksPolled(tasks.size());
@@ -276,6 +341,9 @@ public class TaskPollerService {
     }
 
     private Map<String, Integer> availableCapacityByType() {
+        if (properties.getPoller().getMaxConcurrentByType().isEmpty()) {
+            return Map.of();
+        }
         Map<String, Integer> activeByType = new ConcurrentHashMap<>();
         processingTasks.values().forEach(handle ->
                 activeByType.merge(handle.task().getTaskType(), 1, Integer::sum));
@@ -287,48 +355,110 @@ public class TaskPollerService {
 
     /** Run one poll cycle, then schedule the next one using the latest interval. */
     private void pollAndScheduleNext() {
+        synchronized (pollLock) {
+            polling = true;
+            wakeRequested = false;
+            nextPoll = null;
+            lastPollStartNanos = System.nanoTime();
+        }
         try {
             pollAndProcess();
         } finally {
-            ScheduledExecutorService scheduler = pollerScheduler;
-            if (running.get() && scheduler != null && !scheduler.isShutdown()) {
-                scheduler.schedule(this::pollAndScheduleNext, currentPollInterval.get(), TimeUnit.MILLISECONDS);
+            synchronized (pollLock) {
+                polling = false;
+                scheduleNextPollLocked(wakeRequested ? earlyPollDelayMs() : currentPollInterval.get());
             }
         }
     }
 
     /**
-     * Send heartbeats for all tasks being processed by this worker, and check for
-     * tasks that have overrun their execution timeout.
+     * Called when a task finishes and frees a worker slot. If the queue had work on the last
+     * poll, poll again right away (bounded by the minimum poll interval) so the slot does not
+     * sit idle until the next scheduled poll. Skipped while the queue is empty so adaptive
+     * backoff still protects the database.
      */
+    private void requestEarlyPoll() {
+        if (!lastPollFoundWork) {
+            return;
+        }
+        synchronized (pollLock) {
+            if (!running.get() || pollerScheduler == null) {
+                return;
+            }
+            if (polling) {
+                wakeRequested = true;
+                return;
+            }
+            long delay = earlyPollDelayMs();
+            if (nextPoll == null || nextPoll.getDelay(TimeUnit.MILLISECONDS) > delay) {
+                scheduleNextPollLocked(delay);
+            }
+        }
+    }
+
+    private long earlyPollDelayMs() {
+        long sinceLastPollMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - lastPollStartNanos);
+        return Math.max(0, properties.getPoller().getMinPollIntervalMs() - sinceLastPollMs);
+    }
+
+    private void scheduleNextPollLocked(long delayMs) {
+        ScheduledExecutorService scheduler = pollerScheduler;
+        if (!running.get() || scheduler == null || scheduler.isShutdown()) {
+            return;
+        }
+        if (nextPoll != null) {
+            nextPoll.cancel(false);
+        }
+        try {
+            nextPoll = scheduler.schedule(this::pollAndScheduleNext, delayMs, TimeUnit.MILLISECONDS);
+        } catch (RejectedExecutionException e) {
+            nextPoll = null;
+        }
+    }
+
+    /** Send one batched heartbeat for every task this worker is processing. */
     private void sendHeartbeats() {
+        try {
+            if (processingTasks.isEmpty()) {
+                return;
+            }
+            List<UUID> ids = new ArrayList<>(processingTasks.size());
+            processingTasks.values().forEach(handle -> ids.add(handle.task().getId()));
+            taskQueueService.updateHeartbeats(ids);
+            log.debug("Sent heartbeats for {} tasks", ids.size());
+        } catch (Exception e) {
+            log.error("Error sending heartbeats: {}", e.getMessage(), e);
+        }
+    }
+
+    /** Cancel and fail tasks that have overrun their execution timeout. */
+    private void enforceTimeouts() {
         try {
             for (Map.Entry<String, ProcessingHandle> entry : processingTasks.entrySet()) {
                 Task task = entry.getValue().task();
-
-                if (hasTimedOut(task)) {
-                    // Atomically claim this task so a concurrent normal completion
-                    // doesn't also try to handle it (see TaskQueueService's
-                    // PROCESSING-status guard for the corresponding DB-side safeguard).
-                    ProcessingHandle claimed = processingTasks.remove(entry.getKey());
-                    if (claimed != null) {
-                        int timeoutSeconds = effectiveTimeoutSeconds(task);
-                        log.warn("Task {} exceeded timeout of {}s, cancelling", task.getId(), timeoutSeconds);
-                        claimed.future().cancel(true);
-                        taskQueueService.failTask(task.getId(), task.getAttemptCount(),
-                                "Task exceeded timeout of " + timeoutSeconds + "s");
-                    }
+                if (!hasTimedOut(task)) {
                     continue;
                 }
-
-                taskQueueService.updateHeartbeat(task.getId());
-            }
-
-            if (!processingTasks.isEmpty()) {
-                log.debug("Sent heartbeats for {} tasks", processingTasks.size());
+                // Atomically claim this task so a concurrent normal completion
+                // doesn't also try to handle it (see TaskQueueService's
+                // PROCESSING-status guard for the corresponding DB-side safeguard).
+                ProcessingHandle claimed = processingTasks.remove(entry.getKey(), entry.getValue())
+                        ? entry.getValue() : null;
+                if (claimed != null) {
+                    int timeoutSeconds = effectiveTimeoutSeconds(task);
+                    log.warn("Task {} exceeded timeout of {}s, cancelling", task.getId(), timeoutSeconds);
+                    claimed.future().cancel(true);
+                    try {
+                        taskQueueService.failTask(task.getId(), task.getAttemptCount(),
+                                "Task exceeded timeout of " + timeoutSeconds + "s");
+                    } catch (Exception e) {
+                        log.error("Could not record timeout for task {}: {}", task.getId(), e.getMessage(), e);
+                    }
+                    requestEarlyPoll();
+                }
             }
         } catch (Exception e) {
-            log.error("Error sending heartbeats: {}", e.getMessage(), e);
+            log.error("Error enforcing task timeouts: {}", e.getMessage(), e);
         }
     }
 

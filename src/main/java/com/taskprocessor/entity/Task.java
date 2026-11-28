@@ -2,6 +2,7 @@ package com.taskprocessor.entity;
 
 import jakarta.persistence.*;
 import lombok.*;
+import org.springframework.data.domain.Persistable;
 
 import java.time.Instant;
 import java.util.UUID;
@@ -12,8 +13,8 @@ import java.util.UUID;
  */
 @Entity
 @Table(name = "tasks", indexes = {
-    @Index(name = "idx_tasks_status_priority_created", columnList = "status, priority DESC, created_at ASC"),
-    @Index(name = "idx_tasks_status", columnList = "status"),
+    @Index(name = "idx_tasks_pending_queue", columnList = "priority DESC, created_at ASC"),
+    @Index(name = "idx_tasks_outstanding", columnList = "task_type, status"),
     @Index(name = "idx_tasks_worker_id", columnList = "worker_id"),
     @Index(name = "idx_tasks_heartbeat", columnList = "last_heartbeat")
 })
@@ -22,7 +23,7 @@ import java.util.UUID;
 @NoArgsConstructor
 @AllArgsConstructor
 @Builder
-public class Task {
+public class Task implements Persistable<UUID> {
 
     @Id
     private UUID id;
@@ -129,6 +130,27 @@ public class Task {
      */
     @Column(name = "timeout_seconds")
     private Integer timeoutSeconds;
+
+    /**
+     * True until the entity has been persisted or loaded. Lets Spring Data issue a plain
+     * INSERT for tasks whose id is assigned up front instead of a SELECT-then-INSERT merge.
+     */
+    @Transient
+    @Builder.Default
+    @Getter(AccessLevel.NONE)
+    @Setter(AccessLevel.NONE)
+    private boolean newEntity = true;
+
+    @Override
+    public boolean isNew() {
+        return newEntity;
+    }
+
+    @PostLoad
+    @PostPersist
+    void markNotNew() {
+        newEntity = false;
+    }
 
     @PrePersist
     protected void onCreate() {
